@@ -61,15 +61,22 @@ export function SetupCameraPreview({ deviceIndex, label }: Props) {
           setFrame(msg.image);
           setWsStatus("live");
         }
-        if (msg.type === "preview_status" && msg.status === "error") {
-          setWsStatus("error");
+        if (msg.type === "preview_status") {
+          if (msg.status === "error") {
+            setWsStatus("error");
+            setFrame(null);
+          }
+          else if (msg.status === "streaming") setWsStatus("live");
         }
       } catch {
         // ignore
       }
     };
 
-    socket.onclose = () => setWsStatus("closed");
+    socket.onclose = () => {
+      setWsStatus("closed");
+      setFrame(null);
+    };
     socket.onerror = () => {
       setWsStatus("error");
       socket.close();

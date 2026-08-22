@@ -43,13 +43,54 @@ async def broadcast(event: dict):
     for client in stale:
         clients.discard(client)
 
+import time
+
+parked_vehicles = set()
+recent_reads = {}
+
 async def create_result(plate: str, confidence: float, source: str, processed_image: str | None = None):
     global occupied
+    
+    now = time.time()
+    
+    # 60 second global cooldown for any read of this plate to prevent flickering
+    if plate in recent_reads and (now - recent_reads[plate] < 60):
+        recent_reads[plate] = now # Extend cooldown while vehicle lingers in view
+        return None
+        
+    recent_reads[plate] = now
+    
+    if plate in parked_vehicles:
+        # Exiting
+        parked_vehicles.remove(plate)
+        occupied = max(occupied - 1, 0)
+        is_exit = True
+    else:
+        # Entering
+        parked_vehicles.add(plate)
+        is_exit = False
+        
     settings = repository.get_settings()
+    if not is_exit:
+        occupied = min(occupied + 1, settings["total_slots"])
+        
     person = repository.vehicle_for_plate(plate)
-    slot = slots[occupied % len(slots)]
-    occupied = min(occupied + 1, settings["total_slots"])
-    event = {"type": "parking_result", "plate": plate, **person, "slot": slot, "direction": "Level 1 · East Wing", "confidence": confidence, "source": source, "timestamp": datetime.now(timezone.utc).isoformat(), "occupied": occupied, "totalSlots": settings["total_slots"], "processedImage": processed_image}
+    slot = slots[occupied % len(slots)] if not is_exit else "N/A"
+    
+    event = {
+        "type": "parking_result", 
+        "plate": plate, 
+        **person, 
+        "slot": slot, 
+        "direction": "Level 1 · East Wing" if not is_exit else "Departed", 
+        "confidence": confidence, 
+        "source": source, 
+        "timestamp": datetime.now(timezone.utc).isoformat(), 
+        "occupied": occupied, 
+        "totalSlots": settings["total_slots"], 
+        "processedImage": processed_image
+    }
+    
     repository.add_result(event)
     await broadcast(event)
     return event
@@ -94,6 +135,8 @@ async def configured_camera_stream(websocket: WebSocket, role: str):
     """Read configured hardware camera frames and emit processed output to its preview."""
     await websocket.accept()
     capture = None
+    current_device_index = None
+    
     try:
         while True:
             config = cameras_input.get_config(role)
@@ -101,20 +144,27 @@ async def configured_camera_stream(websocket: WebSocket, role: str):
                 if capture is not None:
                     await asyncio.to_thread(capture.release)
                     capture = None
+                    current_device_index = None
                 await websocket.send_json({"type": "camera_status", "role": role, "status": "not_configured", "message": f"Enable the {role} camera in Admin Setup."})
                 await asyncio.sleep(2.0)
                 continue
                 
+            if current_device_index is not None and current_device_index != config["device_index"]:
+                # Config changed, release old capture so it can be re-opened
+                if capture is not None:
+                    await asyncio.to_thread(capture.release)
+                    capture = None
+                    
             if capture is None:
                 try:
                     capture = await asyncio.to_thread(cameras_input.open_camera, config)
+                    current_device_index = config["device_index"]
                     await websocket.send_json({"type": "camera_status", "role": role, "status": "streaming"})
                 except Exception as e:
                     await websocket.send_json({"type": "camera_status", "role": role, "status": "error", "message": str(e)})
                     await asyncio.sleep(2.0)
                     continue
 
-            last_plate, last_result_at = "", 0.0
             consecutive_failures = 0
             
             # Inner loop for reading frames while config is likely unchanged
@@ -129,10 +179,8 @@ async def configured_camera_stream(websocket: WebSocket, role: str):
                 consecutive_failures = 0
                 plate, confidence, processed = await asyncio.to_thread(process_camera_frame, frame)
                 await websocket.send_json({"type": "camera_frame", "source": role, "processedImage": processed, "timestamp": datetime.now(timezone.utc).isoformat()})
-                now = asyncio.get_running_loop().time()
-                if plate != "UNKNOWN" and (plate != last_plate or now - last_result_at > 12):
+                if plate != "UNKNOWN":
                     await create_result(plate, confidence, role, processed)
-                    last_plate, last_result_at = plate, now
                 await asyncio.sleep(.25)
     except WebSocketDisconnect:
         pass

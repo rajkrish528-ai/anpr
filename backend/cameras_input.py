@@ -75,40 +75,26 @@ def _open_cap(index: int):
 # ---------------------------------------------------------------------------
 
 def list_system_cameras(max_devices: int = 4) -> list[dict]:
-    import cv2
-    import os
-    os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
-    
-    cameras = []
-    
-    # Try to probe for real hardware cameras
-    for i in range(max_devices):
-        try:
-            # Try DirectShow first on Windows as it's less prone to deadlocks
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                ok, _ = cap.read()
-                cameras.append({
-                    "index": i,
-                    "name": f"Hardware Camera {i}",
-                    "available": True,
-                    "backend": "dshow",
-                    "readable": ok,
-                })
-            cap.release()
-        except Exception:
-            pass
-
-    # Always append the mock camera as a fallback option
-    cameras.append({
-        "index": 99,
-        "name": "Synthetic Mock Camera",
-        "available": True,
-        "backend": "mock",
-        "readable": True,
-    })
-    
-    return cameras
+    """
+    Active hardware probing is disabled to prevent cv2.VideoCapture deadlocks 
+    that crash the backend on Windows. We statically return Camera 0 and the Mock Camera.
+    """
+    return [
+        {
+            "index": 0,
+            "name": "Hardware Camera 0",
+            "available": True,
+            "backend": "default",
+            "readable": True,
+        },
+        {
+            "index": 99,
+            "name": "Synthetic Mock Camera",
+            "available": True,
+            "backend": "mock",
+            "readable": True,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

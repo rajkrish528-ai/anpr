@@ -147,4 +147,7 @@ def get_pipeline_status():
 async def post_manual_result(payload: ManualCheck):
     # Imported here to keep REST routing independent from the WebSocket module at startup.
     from .websocket import create_result
-    return await create_result(repository.normalise_plate(payload.plate), 1.0, "manual")
+    res = await create_result(repository.normalise_plate(payload.plate), 1.0, "manual")
+    if res is None:
+        raise HTTPException(status_code=400, detail="Plate is currently on cooldown.")
+    return res
