@@ -1,0 +1,123 @@
+"""HTTP REST endpoints for admin and result-display clients."""
+from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import Response
+from . import vehicle_repository as repository
+from .schemas import ManualCheck, ParkingResult, VehicleCreate, VehicleRecord, VehicleUpdate
+from .schemas import AppSettings, CameraConfig, CameraConfigUpdate
+from . import cameras_input
+
+
+router = APIRouter(prefix="/api", tags=["parking"])
+
+@router.get("/vehicles", response_model=list[VehicleRecord])
+def get_vehicles():
+    return repository.list_vehicles()
+
+@router.get("/vehicles/{plate}", response_model=VehicleRecord)
+def get_vehicle(plate: str):
+    vehicle = repository.get_vehicle(plate)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle record not found")
+    return vehicle
+
+@router.post("/vehicles", response_model=VehicleRecord, status_code=status.HTTP_201_CREATED)
+def post_vehicle(payload: VehicleCreate):
+    if repository.get_vehicle(payload.plate):
+        raise HTTPException(status_code=409, detail="A vehicle with this plate already exists")
+    return repository.create_vehicle(payload.plate, payload.owner_name, payload.category)
+
+@router.patch("/vehicles/{plate}", response_model=VehicleRecord)
+def patch_vehicle(plate: str, payload: VehicleUpdate):
+    vehicle = repository.update_vehicle(plate, payload.owner_name, payload.category)
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle record not found")
+    return vehicle
+
+@router.delete("/vehicles/{plate}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_vehicle(plate: str):
+    if not repository.delete_vehicle(plate):
+        raise HTTPException(status_code=404, detail="Vehicle record not found")
+
+@router.get("/results", response_model=list[ParkingResult])
+def get_results(limit: int = Query(default=50, ge=1, le=200)):
+    return repository.list_results(limit)
+
+@router.get("/results/latest", response_model=ParkingResult)
+def get_latest_result():
+    result = repository.latest_result()
+    if not result:
+        raise HTTPException(status_code=404, detail="No parking result exists yet")
+    return result
+
+@router.get("/cameras/system")
+async def get_system_cameras():
+    """Return all physically available cameras detected by OpenCV (runs in threadpool)."""
+    import asyncio
+    return await asyncio.to_thread(cameras_input.list_system_cameras)
+
+@router.get("/cameras/system/{device_index}/snapshot", response_class=Response)
+async def get_camera_snapshot(device_index: int):
+    import asyncio
+    try:
+        data = await asyncio.to_thread(cameras_input.capture_snapshot, device_index)
+        return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+
+@router.get("/cameras", response_model=list[CameraConfig])
+def get_camera_configs():
+    return cameras_input.list_configs()
+
+@router.put("/cameras/{role}", response_model=CameraConfig)
+def put_camera_config(role: str, payload: CameraConfigUpdate):
+    if role not in {"gate", "parking"}:
+        raise HTTPException(status_code=404, detail="Camera role must be gate or parking")
+    return cameras_input.save_config(role, **payload.model_dump())
+
+@router.get("/settings", response_model=AppSettings)
+def get_settings():
+    return repository.get_settings()
+
+@router.put("/settings", response_model=AppSettings)
+def put_settings(payload: AppSettings):
+    return repository.save_settings(payload.campus_name, payload.total_slots)
+
+@router.get("/pipeline/status")
+def get_pipeline_status():
+    """
+    Return current pipeline status for both camera roles:
+    config, whether the device is physically available, and model info.
+    """
+    system_cameras = cameras_input.list_system_cameras()
+    available_indices = {cam["index"] for cam in system_cameras}
+    configs = cameras_input.list_configs()
+    roles = []
+    for cfg in configs:
+        idx = cfg["device_index"]
+        cam_available = idx in available_indices
+        roles.append({
+            "role": cfg["role"],
+            "device_index": idx,
+            "enabled": cfg["enabled"],
+            "detector": cfg["detector"],
+            "ocr_engine": cfg["ocr_engine"],
+            "confidence_threshold": cfg["confidence_threshold"],
+            "camera_available": cam_available,
+            "status": (
+                "active" if cfg["enabled"] and cam_available
+                else "disabled" if not cfg["enabled"]
+                else "unavailable"
+            ),
+        })
+    return {
+        "roles": roles,
+        "system_cameras": system_cameras,
+        "model": "YOLOv8 license-plate",
+        "db_connected": True,
+    }
+
+@router.post("/results/manual", response_model=ParkingResult, status_code=status.HTTP_201_CREATED)
+async def post_manual_result(payload: ManualCheck):
+    # Imported here to keep REST routing independent from the WebSocket module at startup.
+    from .websocket import create_result
+    return await create_result(repository.normalise_plate(payload.plate), 1.0, "manual")
