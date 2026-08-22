@@ -2,7 +2,6 @@
 // SystemSetup page — full camera & pipeline configuration
 // ─────────────────────────────────────────────────────────────
 import React, { useCallback, useEffect, useState } from "react";
-import { Header } from "../Layout";
 import { SetupCameraPreview } from "../components/SetupCameraPreview";
 import { api } from "../api";
 import type {
@@ -298,10 +297,8 @@ export function SystemSetup() {
 
   return (
     <>
-      <Header
-        title="System setup"
-        note="Configure cameras, recognition pipeline, and detection parameters."
-      />
+      <h2>System Setup</h2>
+      <p>Configure cameras, recognition pipeline, and detection parameters.</p>
 
       <PipelineBar status={pipelineStatus} />
 

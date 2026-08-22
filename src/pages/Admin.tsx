@@ -6,8 +6,9 @@ import { Header } from "../Layout";
 import { useLive, formatTime } from "../LiveContext";
 import { api } from "../api";
 import type { AppSettings, VehicleRecord } from "../types";
+import { SystemSetup } from "./SystemSetup";
 
-type Tab = "manual" | "data" | "settings";
+type Tab = "manual" | "data" | "system" | "settings";
 type Category = "Student" | "Faculty" | "Staff" | "Visitor";
 
 interface VehicleForm {
@@ -25,39 +26,8 @@ function Metric({ label, value }: { label: string; value: number | string }) {
   );
 }
 
-function LoginGate({ onLogin }: { onLogin: () => void }) {
-  return (
-    <>
-      <Header title="Administrator login" note="Secure access to parking operations" />
-      <form
-        className="login card"
-        onSubmit={(e) => {
-          e.preventDefault();
-          sessionStorage.setItem("parking-admin", "true");
-          onLogin();
-        }}
-      >
-        <h2>Sign in</h2>
-        <label>
-          Email
-          <input type="email" required placeholder="admin@campus.edu" />
-        </label>
-        <label>
-          Password
-          <input type="password" required placeholder="••••••••" />
-        </label>
-        <button className="primary">Sign in</button>
-        <small>Demo login accepts any non-empty credentials.</small>
-      </form>
-    </>
-  );
-}
-
 export function Admin() {
   const { result, history } = useLive();
-  const [logged, setLogged] = useState(
-    sessionStorage.getItem("parking-admin") === "true",
-  );
   const [tab, setTab] = useState<Tab>("manual");
   const [form, setForm] = useState<VehicleForm>({ plate: "", name: "", category: "Student" });
   const [settings, setSettings] = useState<AppSettings>({
@@ -76,10 +46,8 @@ export function Admin() {
       .catch(() => setNotice("Unable to load admin data."));
 
   useEffect(() => {
-    if (logged) loadAdminData();
-  }, [logged]);
-
-  if (!logged) return <LoginGate onLogin={() => setLogged(true)} />;
+    loadAdminData();
+  }, []);
 
   const manualCheck = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -139,13 +107,13 @@ export function Admin() {
 
       <section className="admin-tabs card">
         <div className="tab-list">
-          {(["manual", "data", "settings"] as Tab[]).map((t) => (
+          {(["manual", "data", "system", "settings"] as Tab[]).map((t) => (
             <button
               key={t}
               className={tab === t ? "active" : ""}
               onClick={() => setTab(t)}
             >
-              {t === "manual" ? "Manual check" : t === "data" ? "Add data" : "Account settings"}
+              {t === "manual" ? "Manual check" : t === "data" ? "Add data" : t === "system" ? "System config" : "Account settings"}
             </button>
           ))}
         </div>
@@ -228,6 +196,12 @@ export function Admin() {
           </div>
         )}
 
+        {tab === "system" && (
+          <div className="admin-content" style={{ marginTop: '2rem' }}>
+            <SystemSetup />
+          </div>
+        )}
+
         {tab === "settings" && (
           <div className="admin-content">
             <h2>Account settings</h2>
@@ -267,9 +241,12 @@ export function Admin() {
               <button className="primary">Save settings</button>
               <button
                 type="button"
-                onClick={() => {
-                  sessionStorage.removeItem("parking-admin");
-                  setLogged(false);
+                onClick={async () => {
+                  try {
+                    await api("/logout", { method: "POST" });
+                  } catch (e) {} // Ignore error if token already expired
+                  localStorage.removeItem("parking-admin-token");
+                  window.location.href = "/login";
                 }}
               >
                 Sign out

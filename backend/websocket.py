@@ -16,7 +16,7 @@ def get_analyzer():
     global analyzer
     if analyzer is None:
         from analyzer import LicensePlateAnalyzer
-        analyzer = LicensePlateAnalyzer(model_path="models/best.pt", confidence=.40, use_gpu=False)
+        analyzer = LicensePlateAnalyzer(model_path="models/best.pt", confidence=.40)
     return analyzer
 
 def analyse_image(data_url: str):
@@ -93,33 +93,47 @@ def process_camera_frame(frame):
 async def configured_camera_stream(websocket: WebSocket, role: str):
     """Read configured hardware camera frames and emit processed output to its preview."""
     await websocket.accept()
-    config = cameras_input.get_config(role)
-    if not config or not config["enabled"]:
-        await websocket.send_json({"type": "camera_status", "role": role, "status": "not_configured", "message": f"Enable the {role} camera in Admin Setup."})
-        await websocket.close()
-        return
     capture = None
-    last_plate, last_result_at = "", 0.0
-    consecutive_failures = 0
     try:
-        capture = await asyncio.to_thread(cameras_input.open_camera, config)
-        await websocket.send_json({"type": "camera_status", "role": role, "status": "streaming"})
         while True:
-            ok, frame = await asyncio.to_thread(capture.read)
-            if not ok or frame is None:
-                consecutive_failures += 1
-                if consecutive_failures > 20:
-                    raise RuntimeError("Camera stopped returning frames")
-                await asyncio.sleep(0.1)
+            config = cameras_input.get_config(role)
+            if not config or not config["enabled"]:
+                if capture is not None:
+                    await asyncio.to_thread(capture.release)
+                    capture = None
+                await websocket.send_json({"type": "camera_status", "role": role, "status": "not_configured", "message": f"Enable the {role} camera in Admin Setup."})
+                await asyncio.sleep(2.0)
                 continue
+                
+            if capture is None:
+                try:
+                    capture = await asyncio.to_thread(cameras_input.open_camera, config)
+                    await websocket.send_json({"type": "camera_status", "role": role, "status": "streaming"})
+                except Exception as e:
+                    await websocket.send_json({"type": "camera_status", "role": role, "status": "error", "message": str(e)})
+                    await asyncio.sleep(2.0)
+                    continue
+
+            last_plate, last_result_at = "", 0.0
             consecutive_failures = 0
-            plate, confidence, processed = await asyncio.to_thread(process_camera_frame, frame)
-            await websocket.send_json({"type": "camera_frame", "source": role, "processedImage": processed, "timestamp": datetime.now(timezone.utc).isoformat()})
-            now = asyncio.get_running_loop().time()
-            if plate != "UNKNOWN" and (plate != last_plate or now - last_result_at > 12):
-                await create_result(plate, confidence, role, processed)
-                last_plate, last_result_at = plate, now
-            await asyncio.sleep(.25)
+            
+            # Inner loop for reading frames while config is likely unchanged
+            for _ in range(10): # check config every 10 frames (~2.5s)
+                ok, frame = await asyncio.to_thread(capture.read)
+                if not ok or frame is None:
+                    consecutive_failures += 1
+                    if consecutive_failures > 20:
+                        raise RuntimeError("Camera stopped returning frames")
+                    await asyncio.sleep(0.1)
+                    continue
+                consecutive_failures = 0
+                plate, confidence, processed = await asyncio.to_thread(process_camera_frame, frame)
+                await websocket.send_json({"type": "camera_frame", "source": role, "processedImage": processed, "timestamp": datetime.now(timezone.utc).isoformat()})
+                now = asyncio.get_running_loop().time()
+                if plate != "UNKNOWN" and (plate != last_plate or now - last_result_at > 12):
+                    await create_result(plate, confidence, role, processed)
+                    last_plate, last_result_at = plate, now
+                await asyncio.sleep(.25)
     except WebSocketDisconnect:
         pass
     except Exception as error:
@@ -129,7 +143,7 @@ async def configured_camera_stream(websocket: WebSocket, role: str):
             pass
     finally:
         if capture is not None:
-            capture.release()
+            await asyncio.to_thread(capture.release)
 
 @router.websocket("/ws")
 async def live_events(websocket: WebSocket):

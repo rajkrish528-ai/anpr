@@ -9,12 +9,22 @@ import { LiveProvider } from "./LiveContext";
 import { Shell } from "./Layout";
 import "./styles.css";
 
-// Pages
 import { Dashboard }     from "./pages/Dashboard";
 import { SystemSetup }   from "./pages/SystemSetup";
 import { Admin }         from "./pages/Admin";
 import { ResultDisplay } from "./pages/ResultDisplay";
 import { CameraMonitor } from "./pages/CameraMonitor";
+import { Login }         from "./pages/Login";
+
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const token = localStorage.getItem("parking-admin-token");
+  const { pathname } = useLocation();
+  
+  if (!token) {
+    return <Navigate to="/login" replace state={{ from: pathname }} />;
+  }
+  return <>{children}</>;
+}
 
 function AppRoutes() {
   const { pathname } = useLocation();
@@ -31,8 +41,9 @@ function AppRoutes() {
     <Shell>
       <Routes>
         <Route path="/"      element={<Dashboard />} />
-        <Route path="/setup" element={<SystemSetup />} />
-        <Route path="/admin" element={<Admin />} />
+        <Route path="/login" element={<Login />} />
+        <Route path="/setup" element={<ProtectedRoute><SystemSetup /></ProtectedRoute>} />
+        <Route path="/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />
         <Route path="*"      element={<Navigate to="/" replace />} />
       </Routes>
     </Shell>

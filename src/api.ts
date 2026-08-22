@@ -20,7 +20,21 @@ export async function api<T = unknown>(
   path: string,
   options?: RequestInit,
 ): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, options);
+  const token = localStorage.getItem("parking-admin-token");
+  const headers = new Headers(options?.headers);
+  
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  const response = await fetch(`${API_URL}${path}`, { ...options, headers });
+  
+  if (response.status === 401) {
+    // If unauthorized, clear token and maybe redirect to login
+    localStorage.removeItem("parking-admin-token");
+    window.dispatchEvent(new Event("auth-expired"));
+  }
+
   if (!response.ok) {
     const body = await response.json().catch(() => ({})) as Record<string, unknown>;
     throw new Error((body["detail"] as string | undefined) ?? "Request failed");

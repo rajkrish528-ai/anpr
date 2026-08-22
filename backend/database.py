@@ -62,7 +62,33 @@ def initialise_database():
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token TEXT PRIMARY KEY,
+                admin_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+            );
+
             INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES ('campus_name', 'Smart Campus');
             INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES ('total_slots', '50');
             """
+        )
+        # Default admin seed: admin@campus.edu / admin123
+        # Hash generated using SHA-256 for simplicity in SQLite without external dependencies
+        import hashlib
+        salt = "smart-parking-salt"
+        pwd = "admin123"
+        hashed = hashlib.sha256((salt + pwd).encode("utf-8")).hexdigest()
+        
+        connection.execute(
+            "INSERT OR IGNORE INTO admins (email, password_hash) VALUES (?, ?)",
+            ("admin@campus.edu", hashed)
         )

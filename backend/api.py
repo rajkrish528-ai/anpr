@@ -2,12 +2,39 @@
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import Response
 from . import vehicle_repository as repository
-from .schemas import ManualCheck, ParkingResult, VehicleCreate, VehicleRecord, VehicleUpdate
+from .schemas import ManualCheck, ParkingResult, VehicleCreate, VehicleRecord, VehicleUpdate, LoginRequest, AuthResponse
 from .schemas import AppSettings, CameraConfig, CameraConfigUpdate
 from . import cameras_input
+from .auth import get_current_admin, verify_password, create_session_token, oauth2_scheme
+from .database import get_connection
+from typing import Annotated, Any
+from fastapi import Depends
 
 
 router = APIRouter(prefix="/api", tags=["parking"])
+
+@router.post("/login", response_model=AuthResponse)
+def login(payload: LoginRequest):
+    with get_connection() as conn:
+        admin = conn.execute(
+            "SELECT id, password_hash FROM admins WHERE email = ?",
+            (payload.email,)
+        ).fetchone()
+        
+        if not admin or not verify_password(payload.password, admin["password_hash"]):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
+        token = create_session_token(admin["id"])
+        return {"token": token, "admin_id": admin["id"]}
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(admin: Annotated[dict, Depends(get_current_admin)], token: Annotated[str, Depends(oauth2_scheme)]):
+    with get_connection() as conn:
+        conn.execute("DELETE FROM admin_sessions WHERE token = ?", (token,))
 
 @router.get("/vehicles", response_model=list[VehicleRecord])
 def get_vehicles():
@@ -21,20 +48,20 @@ def get_vehicle(plate: str):
     return vehicle
 
 @router.post("/vehicles", response_model=VehicleRecord, status_code=status.HTTP_201_CREATED)
-def post_vehicle(payload: VehicleCreate):
+def post_vehicle(payload: VehicleCreate, admin: Annotated[dict, Depends(get_current_admin)]):
     if repository.get_vehicle(payload.plate):
         raise HTTPException(status_code=409, detail="A vehicle with this plate already exists")
     return repository.create_vehicle(payload.plate, payload.owner_name, payload.category)
 
 @router.patch("/vehicles/{plate}", response_model=VehicleRecord)
-def patch_vehicle(plate: str, payload: VehicleUpdate):
+def patch_vehicle(plate: str, payload: VehicleUpdate, admin: Annotated[dict, Depends(get_current_admin)]):
     vehicle = repository.update_vehicle(plate, payload.owner_name, payload.category)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle record not found")
     return vehicle
 
 @router.delete("/vehicles/{plate}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_vehicle(plate: str):
+def remove_vehicle(plate: str, admin: Annotated[dict, Depends(get_current_admin)]):
     if not repository.delete_vehicle(plate):
         raise HTTPException(status_code=404, detail="Vehicle record not found")
 
@@ -69,7 +96,7 @@ def get_camera_configs():
     return cameras_input.list_configs()
 
 @router.put("/cameras/{role}", response_model=CameraConfig)
-def put_camera_config(role: str, payload: CameraConfigUpdate):
+def put_camera_config(role: str, payload: CameraConfigUpdate, admin: Annotated[dict, Depends(get_current_admin)]):
     if role not in {"gate", "parking"}:
         raise HTTPException(status_code=404, detail="Camera role must be gate or parking")
     return cameras_input.save_config(role, **payload.model_dump())
@@ -79,7 +106,7 @@ def get_settings():
     return repository.get_settings()
 
 @router.put("/settings", response_model=AppSettings)
-def put_settings(payload: AppSettings):
+def put_settings(payload: AppSettings, admin: Annotated[dict, Depends(get_current_admin)]):
     return repository.save_settings(payload.campus_name, payload.total_slots)
 
 @router.get("/pipeline/status")

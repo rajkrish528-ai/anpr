@@ -39,8 +39,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
           <NavLink to="/gate-camera-preview">◉ Gate camera</NavLink>
           <NavLink to="/parking-camera-preview">▧ Parking camera</NavLink>
           <NavLink to="/result">▣ Result display</NavLink>
-          <NavLink to="/setup">⚙ System setup</NavLink>
-          <NavLink to="/admin">☰ Admin</NavLink>
+          <NavLink to="/admin">☰ Admin Panel</NavLink>
         </nav>
         <div className="side-footer">
           <span className="pulse" /> ANPR service online

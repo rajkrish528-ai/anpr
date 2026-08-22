@@ -58,6 +58,7 @@ def _open_cap(index: int):
     os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 
     for backend_id, backend_name in [
+        (cv2.CAP_DSHOW, "dshow"),
         (cv2.CAP_ANY,  "default"),
         (cv2.CAP_MSMF, "msmf"),
     ]:
@@ -74,18 +75,40 @@ def _open_cap(index: int):
 # ---------------------------------------------------------------------------
 
 def list_system_cameras(max_devices: int = 4) -> list[dict]:
-    """
-    Hardware camera probing is disabled on this machine because cv2.VideoCapture
-    deadlocks and hangs the backend. We immediately return the Synthetic Mock Camera
-    so the pipeline can still be tested and demonstrated.
-    """
-    return [{
+    import cv2
+    import os
+    os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+    
+    cameras = []
+    
+    # Try to probe for real hardware cameras
+    for i in range(max_devices):
+        try:
+            # Try DirectShow first on Windows as it's less prone to deadlocks
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                ok, _ = cap.read()
+                cameras.append({
+                    "index": i,
+                    "name": f"Hardware Camera {i}",
+                    "available": True,
+                    "backend": "dshow",
+                    "readable": ok,
+                })
+            cap.release()
+        except Exception:
+            pass
+
+    # Always append the mock camera as a fallback option
+    cameras.append({
         "index": 99,
         "name": "Synthetic Mock Camera",
         "available": True,
         "backend": "mock",
         "readable": True,
-    }]
+    })
+    
+    return cameras
 
 
 # ---------------------------------------------------------------------------

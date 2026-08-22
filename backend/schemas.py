@@ -47,3 +47,11 @@ class CameraConfig(CameraConfigUpdate):
 class AppSettings(BaseModel):
     campus_name: str = Field(min_length=2, max_length=100)
     total_slots: int = Field(ge=1, le=1000)
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class AuthResponse(BaseModel):
+    token: str
+    admin_id: int
