@@ -23,6 +23,7 @@ const INITIAL: ParkingResult = {
   direction: "Level 1 · East Wing",
   confidence: 0.94,
   source: "demo",
+  status: "granted",
   timestamp: new Date().toISOString(),
   occupied: 27,
   totalSlots: 50,

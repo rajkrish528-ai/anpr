@@ -4,15 +4,18 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 Category = Literal["Student", "Faculty", "Staff", "Visitor"]
+PermitTier = Literal[1, 2, 3, 4, 5]
 
 class VehicleCreate(BaseModel):
     plate: str = Field(min_length=2, max_length=24)
     owner_name: str = Field(min_length=2, max_length=100)
     category: Category
+    permit_tier: PermitTier = 4
 
 class VehicleUpdate(BaseModel):
     owner_name: str | None = Field(default=None, min_length=2, max_length=100)
     category: Category | None = None
+    permit_tier: PermitTier | None = None
 
 class VehicleRecord(VehicleCreate):
     id: int
@@ -20,6 +23,9 @@ class VehicleRecord(VehicleCreate):
     updated_at: datetime
 
 class ManualCheck(BaseModel):
+    plate: str = Field(min_length=2, max_length=24)
+
+class ManualExit(BaseModel):
     plate: str = Field(min_length=2, max_length=24)
 
 class ParkingResult(BaseModel):
@@ -31,6 +37,7 @@ class ParkingResult(BaseModel):
     direction: str
     confidence: float
     source: str
+    status: str = "granted"
     timestamp: datetime
     processedImage: str | None = None
 
@@ -38,7 +45,7 @@ class CameraConfigUpdate(BaseModel):
     device_index: int = Field(ge=0, le=999)
     enabled: bool = False
     detector: Literal["yolov8_plate"] = "yolov8_plate"
-    ocr_engine: Literal["easyocr"] = "easyocr"
+    ocr_engine: Literal["tesseract"] = "tesseract"
     confidence_threshold: float = Field(default=.40, ge=.05, le=.99)
 
 class CameraConfig(CameraConfigUpdate):

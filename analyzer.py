@@ -1,752 +1,320 @@
-import cv2 as cv
+"""
+ANPR Analyzer — YOLO vehicle detection + YOLO plate detection + Tesseract OCR.
+"""
+import cv2
 import numpy as np
-import pytesseract
 import re
 import os
-
+import time
 from ultralytics import YOLO
+import pytesseract
 
+DEBUG_ANPR = True
+DEBUG_DIR = "debug"
+
+if DEBUG_ANPR:
+    os.makedirs(DEBUG_DIR, exist_ok=True)
 
 class LicensePlateAnalyzer:
+    """AI-powered license plate recognition using YOLOv8 + Tesseract OCR."""
 
     def __init__(
         self,
+        vehicle_model_path="yolo11n.pt",
         model_path="models/best.pt",
         confidence=0.40,
-        tesseract_path=None
+        tesseract_path=None,
     ):
-
+        self.vehicle_model_path = vehicle_model_path
         self.model_path = model_path
         self.confidence = confidence
 
-        self.model = None
-
-        self.image = None
-        self.output_image = None
-
-        self.plates = []
-        self.numbers = []
-
-        # ------------------------------------------------------
-        # Tesseract configuration
-        # ------------------------------------------------------
-
+        # ── Tesseract configuration ──
         if tesseract_path is None:
-
-            tesseract_path = (
-                r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-            )
+            tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
         self.tesseract_path = tesseract_path
-
-        if os.path.exists(
-            self.tesseract_path
-        ):
-
-            pytesseract.pytesseract.tesseract_cmd = (
-                self.tesseract_path
-            )
-
+        self.ocr_loaded = False
+        
+        # 1. First check if it's explicitly at the Windows path
+        if os.path.exists(self.tesseract_path):
+            pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
+            
+        # 2. Try to get version (this will succeed if in PATH or if path above worked)
+        try:
+            version = pytesseract.get_tesseract_version()
+            print(f"[INFO] Tesseract OCR loaded successfully. Version: {version}")
             self.ocr_loaded = True
-
-            print(
-                "[INFO] Tesseract OCR loaded successfully."
-            )
-
-        else:
-
-            self.ocr_loaded = False
-
-            print(
-                "[WARNING] Tesseract executable not found:"
-            )
-
-            print(
-                self.tesseract_path
-            )
-
-        # ------------------------------------------------------
-        # Load YOLO
-        # ------------------------------------------------------
-
-        self.load_model()
-
-    # ==========================================================
-    # LOAD YOLO
-    # ==========================================================
-
-    def load_model(self):
-
-        print(
-            f"[INFO] Loading YOLO model: "
-            f"{self.model_path}"
-        )
-
-        self.model = YOLO(
-            self.model_path
-        )
-
-        print(
-            "[INFO] YOLO model loaded successfully."
-        )
-
-        try:
-
-            print(
-                f"[INFO] Model classes: "
-                f"{self.model.names}"
-            )
-
-        except Exception:
-            pass
-
-    # ==========================================================
-    # SET IMAGE
-    # ==========================================================
-
-    def set_image(
-        self,
-        image
-    ):
-
-        if image is None:
-
-            raise ValueError(
-                "Image cannot be None."
-            )
-
-        self.image = image.copy()
-
-        self.output_image = image.copy()
-
-        self.plates = []
-
-        self.numbers = []
-
-    # ==========================================================
-    # DETECT PLATES
-    # ==========================================================
-
-    def detect_plates(
-        self,
-        image=None
-    ):
-
-        if image is not None:
-
-            self.set_image(
-                image
-            )
-
-        if self.image is None:
-
-            raise ValueError(
-                "No image supplied."
-            )
-
-        results = self.model.predict(
-
-            source=self.image,
-
-            imgsz=640,
-
-            conf=self.confidence,
-
-            iou=0.45,
-
-            verbose=False
-
-        )
-
-        detected_plates = []
-
-        if not results:
-
-            return detected_plates
-
-        result = results[0]
-
-        if result.boxes is None:
-
-            return detected_plates
-
-        for box in result.boxes:
-
-            xyxy = (
-                box.xyxy[0]
-                .cpu()
-                .numpy()
-            )
-
-            x1, y1, x2, y2 = map(
-                int,
-                xyxy
-            )
-
-            confidence = float(
-                box.conf[0]
-                .cpu()
-                .numpy()
-            )
-
-            class_id = int(
-                box.cls[0]
-                .cpu()
-                .numpy()
-            )
-
-            class_name = "license_plate"
-
-            try:
-
-                class_name = self.model.names[
-                    class_id
-                ]
-
-            except Exception:
-
-                pass
-
-            detected_plates.append({
-
-                "bbox": (
-                    x1,
-                    y1,
-                    x2,
-                    y2
-                ),
-
-                "confidence": confidence,
-
-                "class_id": class_id,
-
-                "class_name": class_name
-
-            })
-
-        self.plates = detected_plates
-
-        return detected_plates
-
-    # ==========================================================
-    # CROP PLATE
-    # ==========================================================
-
-    def crop_plate(
-        self,
-        plate,
-        image=None,
-        padding=8
-    ):
-
-        if image is None:
-
-            image = self.image
-
-        if image is None:
-
-            return None
-
-        if isinstance(
-            plate,
-            dict
-        ):
-
-            x1, y1, x2, y2 = plate[
-                "bbox"
-            ]
-
-        else:
-
-            x1, y1, x2, y2 = plate
-
-        height, width = image.shape[:2]
-
-        x1 = max(
-            0,
-            x1 - padding
-        )
-
-        y1 = max(
-            0,
-            y1 - padding
-        )
-
-        x2 = min(
-            width,
-            x2 + padding
-        )
-
-        y2 = min(
-            height,
-            y2 + padding
-        )
-
-        crop = image[
-            y1:y2,
-            x1:x2
-        ]
-
-        if crop.size == 0:
-
-            return None
-
-        return crop
-
-    # ==========================================================
-    # PREPROCESS FOR TESSERACT
-    # ==========================================================
-
-    def preprocess_plate(
-        self,
-        plate_image
-    ):
-
-        if plate_image is None:
-
-            return None
-
-        # ------------------------------------------------------
-        # Upscale
-        # ------------------------------------------------------
-
-        height, width = plate_image.shape[:2]
-
-        resized = cv.resize(
-
-            plate_image,
-
-            (
-                width * 4,
-                height * 4
-            ),
-
-            interpolation=cv.INTER_CUBIC
-
-        )
-
-        # ------------------------------------------------------
-        # Grayscale
-        # ------------------------------------------------------
-
-        gray = cv.cvtColor(
-            resized,
-            cv.COLOR_BGR2GRAY
-        )
-
-        # ------------------------------------------------------
-        # Noise removal
-        # ------------------------------------------------------
-
-        gray = cv.bilateralFilter(
-            gray,
-            9,
-            75,
-            75
-        )
-
-        # ------------------------------------------------------
-        # Contrast
-        # ------------------------------------------------------
-
-        gray = cv.equalizeHist(
-            gray
-        )
-
-        # ------------------------------------------------------
-        # Threshold
-        # ------------------------------------------------------
-
-        threshold = cv.threshold(
-
-            gray,
-
-            0,
-
-            255,
-
-            cv.THRESH_BINARY
-            + cv.THRESH_OTSU
-
-        )[1]
-
-        return threshold
-
-    # ==========================================================
-    # CLEAN PLATE
-    # ==========================================================
-
-    def clean_plate_number(
-        self,
-        text
-    ):
-
-        if not text:
-
-            return ""
-
-        text = str(
-            text
-        ).upper()
-
-        # Remove whitespace
-
-        text = re.sub(
-            r"\s+",
-            "",
-            text
-        )
-
-        # Keep only A-Z and 0-9
-
-        text = re.sub(
-            r"[^A-Z0-9]",
-            "",
-            text
-        )
-
-        return text
-
-    # ==========================================================
-    # TESSERACT OCR
-    # ==========================================================
-
-    def read_plate(
-        self,
-        plate_image
-    ):
-
-        if plate_image is None:
-
-            return ""
-
-        if not self.ocr_loaded:
-
-            return ""
-
-        try:
-
-            processed = (
-                self.preprocess_plate(
-                    plate_image
-                )
-            )
-
-            # --------------------------------------------------
-            # Tesseract configuration
-            #
-            # PSM 7:
-            # Treat image as a single text line
-            #
-            # Whitelist:
-            # only letters and numbers
-            # --------------------------------------------------
-
-            config = (
-                "--psm 7 "
-                "-c "
-                "tessedit_char_whitelist="
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                "0123456789"
-            )
-
-            text = pytesseract.image_to_string(
-
-                processed,
-
-                config=config
-            )
-
-            plate_number = (
-                self.clean_plate_number(
-                    text
-                )
-            )
-
-            return plate_number
-
         except Exception as e:
-
-            print(
-                f"[TESSERACT ERROR] {e}"
-            )
-
-            return ""
-
-    # ==========================================================
-    # GET ONE PLATE NUMBER
-    # ==========================================================
-
-    def get_number_plate_number(
-        self
-    ):
-
-        if not self.plates:
-
-            self.detect_plates()
-
-        if not self.plates:
-
-            return ""
-
-        plate = self.plates[0]
-
-        crop = self.crop_plate(
-            plate
-        )
-
-        return self.read_plate(
-            crop
-        )
-
-    # ==========================================================
-    # GET ALL PLATE NUMBERS
-    # ==========================================================
-
-    def get_all_number_plate_numbers(
-        self
-    ):
-
-        if not self.plates:
-
-            self.detect_plates()
-
-        self.numbers = []
-
-        for plate in self.plates:
-
-            crop = self.crop_plate(
-                plate
-            )
-
-            number = self.read_plate(
-                crop
-            )
-
-            self.numbers.append(
-                number
-            )
-
-        return self.numbers
-
-    # ==========================================================
-    # DRAW RESULTS
-    # ==========================================================
-
-    def draw_results(
-        self
-    ):
-
-        if self.image is None:
-
-            return None
-
-        output = self.image.copy()
-
-        for index, plate in enumerate(
-            self.plates
-        ):
-
-            x1, y1, x2, y2 = plate[
-                "bbox"
-            ]
-
-            confidence = plate[
-                "confidence"
-            ]
-
-            number = ""
-
-            if index < len(
-                self.numbers
-            ):
-
-                number = self.numbers[
-                    index
-                ]
-
-            if not number:
-
-                number = "UNKNOWN"
-
-            # --------------------------------------------------
-            # Bounding box
-            # --------------------------------------------------
-
-            cv.rectangle(
-
-                output,
-
-                (x1, y1),
-
-                (x2, y2),
-
-                (0, 255, 0),
-
-                3
-
-            )
-
-            # --------------------------------------------------
-            # Label
-            # --------------------------------------------------
-
-            label = (
-                f"{number} | "
-                f"{confidence:.0%}"
-            )
-
-            font = (
-                cv.FONT_HERSHEY_SIMPLEX
-            )
-
-            scale = 0.65
-
-            thickness = 2
-
-            (
-                text_width,
-                text_height
-            ), baseline = cv.getTextSize(
-
-                label,
-
-                font,
-
-                scale,
-
-                thickness
-
-            )
-
-            label_y = max(
-                y1,
-                text_height + 10
-            )
-
-            cv.rectangle(
-
-                output,
-
-                (
-                    x1,
-                    label_y - text_height - 10
-                ),
-
-                (
-                    x1 + text_width + 12,
-                    label_y + baseline
-                ),
-
-                (0, 255, 0),
-
-                -1
-
-            )
-
-            cv.putText(
-
-                output,
-
-                label,
-
-                (
-                    x1 + 6,
-                    label_y
-                ),
-
-                font,
-
-                scale,
-
-                (0, 0, 0),
-
-                thickness
-
-            )
-
-        self.output_image = output
-
-        return output
-
-    # ==========================================================
-    # COMPLETE ANALYSIS
-    # ==========================================================
-
-    def analyze(
-        self,
-        image
-    ):
-
-        self.set_image(
-            image
-        )
-
-        # YOLO
-
-        self.detect_plates()
-
-        # Tesseract
-
-        self.get_all_number_plate_numbers()
-
-        # Draw
-
-        output = (
-            self.draw_results()
-        )
-
-        return {
-
-            "image": output,
-
-            "plates": self.plates,
-
-            "numbers": self.numbers,
-
-            "plate_count":
-                len(self.plates)
-
+            print(f"[WARNING] Tesseract executable not found or failed to load: {e}")
+            print(f"Looked at: {self.tesseract_path} and system PATH.")
+            print("Please install Tesseract OCR and update the path.")
+
+        # ── Load YOLO models ──
+        print(f"[INFO] Loading YOLO models: {self.vehicle_model_path}, {self.model_path}")
+        self.vehicle_model = YOLO(self.vehicle_model_path)
+        self.plate_model = YOLO(self.model_path)
+        print("[INFO] YOLO models loaded successfully.")
+
+        self.vehicle_classes = {
+            2: "car",
+            3: "motorcycle",
+            5: "bus",
+            7: "truck",
         }
 
-    # ==========================================================
-    # STATUS
-    # ==========================================================
+    # ──────────────────────────────────────────────────────────
+    # Plate text cleaning & validation
+    # ──────────────────────────────────────────────────────────
 
-    def get_status(
-        self
-    ):
+    def normalize_plate_number(self, text: str) -> str:
+        """Keep only uppercase A-Z and 0-9."""
+        if not text:
+            return ""
+        text = str(text).upper()
+        # Remove anything that isn't a letter or number
+        text = re.sub(r"[^A-Z0-9]", "", text)
+        return text
+
+    def validate_plate(self, text: str):
+        """Do not accept garbage OCR. Ensure it looks somewhat like a plate."""
+        text = self.normalize_plate_number(text)
+        # Indian plates generally have at least 4 chars (e.g. up to 10 chars like MH12AB1234)
+        # We enforce a reasonable minimum to drop garbage like "ABC" or "123"
+        if len(text) < 4 or len(text) > 13:
+            return ""
+        return text
+
+    # ──────────────────────────────────────────────────────────
+    # Preprocessing for Tesseract
+    # ──────────────────────────────────────────────────────────
+
+    def get_preprocessing_variants(self, plate_image):
+        """Create multiple variants of the plate image to give Tesseract the best chance."""
+        if plate_image is None or plate_image.size == 0:
+            return []
+
+        variants = []
+        
+        # 1. Original + grayscale
+        gray_original = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
+        variants.append(("original_gray", gray_original))
+        
+        # Upscale
+        h, w = plate_image.shape[:2]
+        upscaled = cv2.resize(plate_image, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+        gray_upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+        
+        # 2. Upscaled + grayscale
+        variants.append(("upscaled_gray", gray_upscaled))
+        
+        # 3. Upscaled + threshold
+        gray_blur = cv2.bilateralFilter(gray_upscaled, 9, 75, 75)
+        gray_eq = cv2.equalizeHist(gray_blur)
+        _, thresh_otsu = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(("upscaled_thresh", thresh_otsu))
+        
+        # 4. Upscaled + adaptive threshold
+        thresh_adaptive = cv2.adaptiveThreshold(
+            gray_upscaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        variants.append(("upscaled_adaptive", thresh_adaptive))
+        
+        # 5. Sharpened + threshold
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(gray_upscaled, -1, kernel)
+        _, thresh_sharp = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(("sharpened_thresh", thresh_sharp))
+
+        return variants
+
+    # ──────────────────────────────────────────────────────────
+    # Tesseract OCR
+    # ──────────────────────────────────────────────────────────
+
+    def read_plate(self, plate_image):
+        """Read text from a cropped plate image using multiple strategies.
+        Returns (best_normalized_text, confidence, raw_text)."""
+        if not self.ocr_loaded:
+            if DEBUG_ANPR: print("[OCR] Failed: Tesseract not loaded")
+            return "", 0.0, ""
+
+        variants = self.get_preprocessing_variants(plate_image)
+        if not variants:
+            if DEBUG_ANPR: print("[OCR] Failed: No image variants generated")
+            return "", 0.0, ""
+
+        configs = [
+            "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", # Single line
+            "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", # Uniform block (2 lines)
+            "--psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" # Sparse text
+        ]
+
+        best_plate = ""
+        best_conf = 0.0
+        best_raw = ""
+        best_variant = ""
+
+        # Loop through all variants and configs to find the highest confidence valid read
+        for variant_name, img in variants:
+            for config in configs:
+                raw_text = pytesseract.image_to_string(img, config=config).strip()
+                normalized = self.normalize_plate_number(raw_text)
+                
+                valid_plate = self.validate_plate(normalized)
+                if not valid_plate:
+                    continue
+
+                try:
+                    data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
+                    confs = [int(c) for c in data["conf"] if int(c) > 0]
+                    conf = (sum(confs) / len(confs) / 100.0) if confs else 0.5
+                except Exception:
+                    conf = 0.5
+                    
+                if DEBUG_ANPR:
+                    print(f"  [OCR-TEST] Variant: {variant_name}, PSM: {config[:8]}, Raw: '{raw_text}', Norm: '{normalized}', Conf: {conf:.2f}")
+
+                if conf > best_conf:
+                    best_conf = conf
+                    best_plate = valid_plate
+                    best_raw = raw_text
+                    best_variant = variant_name
+
+                    # Save the variant that worked best
+                    if DEBUG_ANPR:
+                        cv2.imwrite(os.path.join(DEBUG_DIR, "latest_processed_plate.jpg"), img)
+
+                # Early exit if we get a very high confidence read
+                if best_conf > 0.85:
+                    break
+            if best_conf > 0.85:
+                break
+
+        if DEBUG_ANPR:
+            print(f"[OCR] FINAL SELECTED -> Raw: '{best_raw}', Normalized: '{best_plate}', Conf: {best_conf:.2f} (from {best_variant})")
+            if not best_plate:
+                print("[OCR] OCR failed or returned garbage.")
+
+        return best_plate, best_conf, best_raw
+
+    # ──────────────────────────────────────────────────────────
+    # Full analysis pipeline
+    # ──────────────────────────────────────────────────────────
+
+    def analyze(self, image):
+        """Run full ANPR pipeline on a single frame."""
+        if image is None:
+            raise ValueError("Image cannot be None.")
+
+        output_image = image.copy()
+        h, w = image.shape[:2]
+        
+        if DEBUG_ANPR:
+            print("\n" + "="*50)
+            print(f"[ANPR] Analyzing new frame ({w}x{h})")
+
+        # 1. Detect and draw vehicles
+        vehicle_results = self.vehicle_model(image, conf=0.25, verbose=False)
+        vehicles = []
+        for result in vehicle_results:
+            if result.boxes is None:
+                continue
+            for box, conf, cls in zip(result.boxes.xyxy, result.boxes.conf, result.boxes.cls):
+                cls = int(cls)
+                if cls not in self.vehicle_classes:
+                    continue
+                vx1, vy1, vx2, vy2 = map(int, box)
+                cv2.rectangle(output_image, (vx1, vy1), (vx2, vy2), (255, 0, 0), 2)
+                cv2.putText(
+                    output_image,
+                    f"{self.vehicle_classes[cls]} {conf:.2f}",
+                    (vx1, vy1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 0, 0), 2,
+                )
+                vehicles.append({
+                    "vehicle_type": self.vehicle_classes[cls],
+                    "vehicle_confidence": round(float(conf), 3),
+                })
+
+        # 2. Detect plates on the FULL image
+        plates = []
+        numbers = []
+
+        plate_results = self.plate_model(image, conf=self.confidence, verbose=False)
+        for plate_result in plate_results:
+            if plate_result.boxes is None:
+                continue
+            for box, conf in zip(plate_result.boxes.xyxy, plate_result.boxes.conf):
+                px1, py1, px2, py2 = map(int, box)
+                plate_confidence = float(conf)
+                
+                if DEBUG_ANPR:
+                    print(f"[ANPR] YOLO detected plate")
+                    print(f"       Bounding box: {px1},{py1},{px2},{py2}")
+                    print(f"       Confidence: {plate_confidence:.2f}")
+
+                # Configurable padding
+                padding = 10
+                cx1 = max(0, px1 - padding)
+                cy1 = max(0, py1 - padding)
+                cx2 = min(w, px2 + padding)
+                cy2 = min(h, py2 + padding)
+
+                plate_crop = image[cy1:cy2, cx1:cx2]
+                
+                crop_h, crop_w = plate_crop.shape[:2]
+                if DEBUG_ANPR:
+                    print(f"[CROP] Width: {crop_w}, Height: {crop_h}")
+                    cv2.imwrite(os.path.join(DEBUG_DIR, "latest_plate.jpg"), plate_crop)
+
+                if crop_w < 40 or crop_h < 15:
+                    if DEBUG_ANPR:
+                        print("[CROP] Plate too small for reliable OCR. Skipping.")
+                    # Draw orange box to indicate detection but skipped OCR
+                    cv2.rectangle(output_image, (px1, py1), (px2, py2), (0, 165, 255), 2)
+                    cv2.putText(output_image, "TOO SMALL", (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    plates.append({"confidence": plate_confidence})
+                    continue
+
+                # Run OCR
+                plate_number, ocr_confidence, raw_text = self.read_plate(plate_crop)
+
+                # Draw bounding box — green if OCR succeeded, orange if plate detected but OCR failed
+                color = (0, 255, 0) if plate_number else (0, 165, 255)
+                cv2.rectangle(output_image, (px1, py1), (px2, py2), color, 2)
+
+                label = f"{plate_number} {ocr_confidence:.0%}" if plate_number else f"plate {plate_confidence:.2f}"
+                cv2.putText(
+                    output_image, label,
+                    (px1, py1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, color, 2,
+                )
+
+                if plate_number:
+                    numbers.append(plate_number)
+                plates.append({"confidence": plate_confidence})
 
         return {
+            "image": output_image,
+            "plates": plates,
+            "numbers": numbers,
+            "vehicles": vehicles,
+        }
 
-            "model_loaded":
-                self.model is not None,
+    # ──────────────────────────────────────────────────────────
+    # Status (for pipeline info endpoint)
+    # ──────────────────────────────────────────────────────────
 
-            "ocr_loaded":
-                self.ocr_loaded,
-
-            "ocr_engine":
-                "Tesseract OCR",
-
-            "model":
-                "YOLOv8n",
-
-            "task":
-                "Object Detection",
-
-            "classes":
-                "license_plate",
-
-            "input_size":
-                "640x640",
-
-            "plates_detected":
-                len(self.plates),
-
-            "plates_read":
-                len([
-                    x for x in self.numbers
-                    if x
-                ])
-
+    def get_status(self):
+        return {
+            "model_loaded": self.plate_model is not None,
+            "ocr_loaded": self.ocr_loaded,
+            "ocr_engine": "Tesseract OCR",
+            "model": "YOLOv8",
+            "task": "Object Detection",
+            "classes": "vehicle + license_plate",
+            "input_size": "640x640",
         }

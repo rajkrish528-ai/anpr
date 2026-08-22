@@ -11,10 +11,12 @@ export interface ParkingResult {
   direction: string;
   confidence: number;
   source: string;
+  status: "granted" | "already_parked" | "no_slot" | "rejected" | "exited";
   timestamp: string;
   occupied: number;
   totalSlots: number;
   processedImage?: string | null;
+  permit_tier?: number;
 }
 
 export interface VehicleRecord {
@@ -22,8 +24,29 @@ export interface VehicleRecord {
   plate: string;
   owner_name: string;
   category: string;
+  permit_tier: number;
   created_at: string;
   updated_at: string;
+}
+
+export interface ActiveVehicle {
+  id: number;
+  plate: string;
+  slot_id: string;
+  owner_name: string;
+  category: string;
+  permit_tier: number;
+  entry_time: string;
+}
+
+export interface DashboardStats {
+  total_slots: number;
+  occupied: number;
+  available: number;
+  active_vehicles: number;
+  today_entries: number;
+  today_exits: number;
+  today_rejected: number;
 }
 
 export interface SystemCamera {

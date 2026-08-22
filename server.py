@@ -54,9 +54,12 @@ def _reconcile_camera_configs() -> None:
 
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     initialise_database()
     _reconcile_camera_configs()
+    # Pre-load YOLO + Tesseract in background so camera views open instantly
+    from backend.websocket import preload_analyzer
+    await preload_analyzer()
 
 
 @app.get("/health")

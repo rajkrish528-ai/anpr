@@ -2,8 +2,10 @@
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import Response
 from . import vehicle_repository as repository
-from .schemas import ManualCheck, ParkingResult, VehicleCreate, VehicleRecord, VehicleUpdate, LoginRequest, AuthResponse
-from .schemas import AppSettings, CameraConfig, CameraConfigUpdate
+from .schemas import (
+    ManualCheck, ManualExit, ParkingResult, VehicleCreate, VehicleRecord, VehicleUpdate,
+    LoginRequest, AuthResponse, AppSettings, CameraConfig, CameraConfigUpdate,
+)
 from . import cameras_input
 from .auth import get_current_admin, verify_password, create_session_token, oauth2_scheme
 from .database import get_connection
@@ -13,6 +15,10 @@ from fastapi import Depends
 
 router = APIRouter(prefix="/api", tags=["parking"])
 
+# ─────────────────────────────────────────────────────────────
+# Authentication
+# ─────────────────────────────────────────────────────────────
+
 @router.post("/login", response_model=AuthResponse)
 def login(payload: LoginRequest):
     with get_connection() as conn:
@@ -20,14 +26,14 @@ def login(payload: LoginRequest):
             "SELECT id, password_hash FROM admins WHERE email = ?",
             (payload.email,)
         ).fetchone()
-        
+
         if not admin or not verify_password(payload.password, admin["password_hash"]):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-            
+
         token = create_session_token(admin["id"])
         return {"token": token, "admin_id": admin["id"]}
 
@@ -35,6 +41,10 @@ def login(payload: LoginRequest):
 def logout(admin: Annotated[dict, Depends(get_current_admin)], token: Annotated[str, Depends(oauth2_scheme)]):
     with get_connection() as conn:
         conn.execute("DELETE FROM admin_sessions WHERE token = ?", (token,))
+
+# ─────────────────────────────────────────────────────────────
+# Vehicle CRUD
+# ─────────────────────────────────────────────────────────────
 
 @router.get("/vehicles", response_model=list[VehicleRecord])
 def get_vehicles():
@@ -51,11 +61,11 @@ def get_vehicle(plate: str):
 def post_vehicle(payload: VehicleCreate, admin: Annotated[dict, Depends(get_current_admin)]):
     if repository.get_vehicle(payload.plate):
         raise HTTPException(status_code=409, detail="A vehicle with this plate already exists")
-    return repository.create_vehicle(payload.plate, payload.owner_name, payload.category)
+    return repository.create_vehicle(payload.plate, payload.owner_name, payload.category, payload.permit_tier)
 
 @router.patch("/vehicles/{plate}", response_model=VehicleRecord)
 def patch_vehicle(plate: str, payload: VehicleUpdate, admin: Annotated[dict, Depends(get_current_admin)]):
-    vehicle = repository.update_vehicle(plate, payload.owner_name, payload.category)
+    vehicle = repository.update_vehicle(plate, payload.owner_name, payload.category, payload.permit_tier)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle record not found")
     return vehicle
@@ -64,6 +74,10 @@ def patch_vehicle(plate: str, payload: VehicleUpdate, admin: Annotated[dict, Dep
 def remove_vehicle(plate: str, admin: Annotated[dict, Depends(get_current_admin)]):
     if not repository.delete_vehicle(plate):
         raise HTTPException(status_code=404, detail="Vehicle record not found")
+
+# ─────────────────────────────────────────────────────────────
+# Results (live activity log)
+# ─────────────────────────────────────────────────────────────
 
 @router.get("/results", response_model=list[ParkingResult])
 def get_results(limit: int = Query(default=50, ge=1, le=200)):
@@ -76,9 +90,70 @@ def get_latest_result():
         raise HTTPException(status_code=404, detail="No parking result exists yet")
     return result
 
+@router.post("/results/manual", response_model=ParkingResult, status_code=status.HTTP_201_CREATED)
+async def post_manual_result(payload: ManualCheck):
+    from .websocket import create_result
+    res = await create_result(repository.normalise_plate(payload.plate), 1.0, "manual")
+    if res is None:
+        raise HTTPException(status_code=400, detail="Plate is currently on cooldown.")
+    return res
+
+# ─────────────────────────────────────────────────────────────
+# Dashboard
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/dashboard")
+def get_dashboard():
+    """Real-time dashboard metrics computed from actual database state."""
+    return repository.get_dashboard_stats()
+
+# ─────────────────────────────────────────────────────────────
+# Active Parking
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/active")
+def get_active_parking():
+    """List all currently parked vehicles."""
+    return repository.list_active_parking()
+
+# ─────────────────────────────────────────────────────────────
+# Vehicle Exit
+# ─────────────────────────────────────────────────────────────
+
+@router.post("/exit")
+async def post_vehicle_exit(payload: ManualExit):
+    """Manually exit a vehicle — release slot, save history, broadcast."""
+    from .websocket import process_exit
+    result = await process_exit(repository.normalise_plate(payload.plate), "manual")
+    if result is None:
+        raise HTTPException(status_code=404, detail="Vehicle is not currently parked.")
+    return result
+
+# ─────────────────────────────────────────────────────────────
+# Parking Slots
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/slots")
+def get_slots():
+    """Return all parking slots with their current status."""
+    return repository.list_slots()
+
+# ─────────────────────────────────────────────────────────────
+# Parking History
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/history")
+def get_history(limit: int = Query(default=50, ge=1, le=500)):
+    """Return completed parking sessions."""
+    return repository.list_history(limit)
+
+# ─────────────────────────────────────────────────────────────
+# Camera system
+# ─────────────────────────────────────────────────────────────
+
 @router.get("/cameras/system")
 async def get_system_cameras():
-    """Return all physically available cameras detected by OpenCV (runs in threadpool)."""
+    """Return all physically available cameras detected by OpenCV."""
     import asyncio
     return await asyncio.to_thread(cameras_input.list_system_cameras)
 
@@ -101,6 +176,10 @@ def put_camera_config(role: str, payload: CameraConfigUpdate, admin: Annotated[d
         raise HTTPException(status_code=404, detail="Camera role must be gate or parking")
     return cameras_input.save_config(role, **payload.model_dump())
 
+# ─────────────────────────────────────────────────────────────
+# Settings
+# ─────────────────────────────────────────────────────────────
+
 @router.get("/settings", response_model=AppSettings)
 def get_settings():
     return repository.get_settings()
@@ -109,12 +188,12 @@ def get_settings():
 def put_settings(payload: AppSettings, admin: Annotated[dict, Depends(get_current_admin)]):
     return repository.save_settings(payload.campus_name, payload.total_slots)
 
+# ─────────────────────────────────────────────────────────────
+# Pipeline status
+# ─────────────────────────────────────────────────────────────
+
 @router.get("/pipeline/status")
 def get_pipeline_status():
-    """
-    Return current pipeline status for both camera roles:
-    config, whether the device is physically available, and model info.
-    """
     system_cameras = cameras_input.list_system_cameras()
     available_indices = {cam["index"] for cam in system_cameras}
     configs = cameras_input.list_configs()
@@ -139,15 +218,6 @@ def get_pipeline_status():
     return {
         "roles": roles,
         "system_cameras": system_cameras,
-        "model": "YOLOv8 license-plate",
+        "model": "YOLOv8 license-plate + Tesseract OCR",
         "db_connected": True,
     }
-
-@router.post("/results/manual", response_model=ParkingResult, status_code=status.HTTP_201_CREATED)
-async def post_manual_result(payload: ManualCheck):
-    # Imported here to keep REST routing independent from the WebSocket module at startup.
-    from .websocket import create_result
-    res = await create_result(repository.normalise_plate(payload.plate), 1.0, "manual")
-    if res is None:
-        raise HTTPException(status_code=400, detail="Plate is currently on cooldown.")
-    return res
