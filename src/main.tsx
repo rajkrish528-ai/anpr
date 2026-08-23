@@ -15,6 +15,7 @@ import { Admin }         from "./pages/Admin";
 import { ResultDisplay } from "./pages/ResultDisplay";
 import { CameraMonitor } from "./pages/CameraMonitor";
 import { Login }         from "./pages/Login";
+import { TestImage }     from "./pages/TestImage";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("parking-admin-token");
@@ -44,6 +45,7 @@ function AppRoutes() {
         <Route path="/login" element={<Login />} />
         <Route path="/setup" element={<ProtectedRoute><SystemSetup /></ProtectedRoute>} />
         <Route path="/admin" element={<ProtectedRoute><Admin /></ProtectedRoute>} />
+        <Route path="/test-image" element={<ProtectedRoute><TestImage /></ProtectedRoute>} />
         <Route path="*"      element={<Navigate to="/" replace />} />
       </Routes>
     </Shell>
