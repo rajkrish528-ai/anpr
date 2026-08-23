@@ -4,17 +4,20 @@
 
 export interface ParkingResult {
   id?: number;
-  plate: string;
-  studentName: string;
-  category: string;
-  slot: string;
-  direction: string;
-  confidence: number;
+  success?: boolean;
+  plate_detected?: boolean;
+  ocr_success?: boolean;
+  plate_number: string;
+  yolo_confidence?: number;
+  studentName?: string;
+  category?: string;
+  slot?: string;
+  direction?: string;
   source: string;
-  status: "granted" | "already_parked" | "no_slot" | "rejected" | "exited";
+  status: "GRANTED" | "ALREADY_PARKED" | "NO_SLOT" | "REJECTED" | "EXITED" | "OCR_FAILED";
   timestamp: string;
-  occupied: number;
-  totalSlots: number;
+  occupied?: number;
+  totalSlots?: number;
   processedImage?: string | null;
   permit_tier?: number;
 }

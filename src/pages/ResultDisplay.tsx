@@ -6,66 +6,100 @@ import { useLive, formatTime } from "../LiveContext";
 
 export function ResultDisplay() {
   const { result } = useLive();
-  const status = result.status || "granted";
+  const status = result.status || "GRANTED";
+  
+  let headerIcon = "🟢";
+  let headerTitle = "VEHICLE DETECTED";
+  let bgClass = "welcome"; 
 
-  let headerIcon = "✓";
-  let headerTitle = "ACCESS GRANTED";
-  let message = "Your vehicle was recognised successfully. Please follow the route shown below.";
-  let bgClass = "welcome"; // default green
-
-  if (status === "already_parked") {
-    headerIcon = "!";
+  if (status === "ALREADY_PARKED") {
+    headerIcon = "🔴";
     headerTitle = "ALREADY PARKED";
-    message = "Our records show this vehicle is already inside the campus.";
-    bgClass = "welcome warning"; // we might need to add CSS for this, or just use existing
-  } else if (status === "no_slot") {
-    headerIcon = "✕";
+    bgClass = "welcome warning";
+  } else if (status === "NO_SLOT") {
+    headerIcon = "🔴";
     headerTitle = "PARKING FULL";
-    message = "Sorry, no parking slots are currently available for your permit tier.";
     bgClass = "welcome error";
-  } else if (status === "exited") {
+  } else if (status === "EXITED") {
     headerIcon = "👋";
-    headerTitle = "GOODBYE";
-    message = "Thank you for visiting. Have a safe journey!";
+    headerTitle = "VEHICLE DEPARTED";
     bgClass = "welcome neutral";
+  } else if (status === "OCR_FAILED") {
+    headerIcon = "⚠";
+    headerTitle = "LICENSE PLATE DETECTED";
+    bgClass = "welcome error";
   }
 
-  // Define some inline styles for the different states if they don't exist in CSS
   const getStyleForStatus = () => {
-    if (status === "already_parked") return { backgroundColor: "#8a6d3b", color: "#fcf8e3" };
-    if (status === "no_slot") return { backgroundColor: "#a94442", color: "#f2dede" };
-    if (status === "exited") return { backgroundColor: "#31708f", color: "#d9edf7" };
-    return {}; // use default from CSS
-  };
-
-  const getCheckStyle = () => {
-    if (status === "already_parked") return { backgroundColor: "#f0ad4e", color: "#fff" };
-    if (status === "no_slot") return { backgroundColor: "#d9534f", color: "#fff" };
-    if (status === "exited") return { backgroundColor: "#5bc0de", color: "#fff" };
+    if (status === "ALREADY_PARKED") return { backgroundColor: "#8a6d3b", color: "#fcf8e3" };
+    if (status === "NO_SLOT" || status === "OCR_FAILED") return { backgroundColor: "#a94442", color: "#f2dede" };
+    if (status === "EXITED") return { backgroundColor: "#31708f", color: "#d9edf7" };
     return {};
   };
 
   return (
     <main className="result-window">
       <section className={bgClass} style={getStyleForStatus()}>
-        <div className="check" style={getCheckStyle()}>{headerIcon}</div>
-        <p className="eyebrow" style={status !== 'granted' ? { color: 'rgba(255,255,255,0.8)' } : {}}>{headerTitle}</p>
-        <h2>{status === "exited" ? "Goodbye" : "Welcome"}, {result.studentName || "visitor"}.</h2>
-        <p style={status !== 'granted' ? { color: 'rgba(255,255,255,0.9)' } : {}}>
-          {message}
-        </p>
-        <div className="assignment">
-          <div>
-            <small style={status !== 'granted' ? { color: 'rgba(255,255,255,0.7)' } : {}}>YOUR PARKING SPACE</small>
-            <strong style={status !== 'granted' ? { color: '#fff' } : {}}>{result.slot || "—"}</strong>
-          </div>
-          <div>
-            <small style={status !== 'granted' ? { color: 'rgba(255,255,255,0.7)' } : {}}>DIRECTION</small>
-            <b style={status !== 'granted' ? { color: '#fff' } : {}}>↗ {result.direction || "Awaiting assignment"}</b>
-            <span style={status !== 'granted' ? { color: 'rgba(255,255,255,0.7)' } : {}}>
-              Plate {result.plate || "unread"} · {formatTime(result.timestamp)}
-            </span>
-          </div>
+        <h2>{headerIcon} {headerTitle}</h2>
+
+        <div style={{ marginTop: '20px', fontSize: '20px' }}>
+          {status === "OCR_FAILED" ? (
+            <>
+              <div style={{ marginBottom: '15px' }}>
+                <span style={{ opacity: 0.8, display: 'block', fontSize: '16px' }}>OCR:</span>
+                <strong>Unable to read registration number</strong>
+              </div>
+              <p style={{ fontSize: '16px', opacity: 0.9 }}>
+                Please move the vehicle closer or adjust the camera.
+              </p>
+            </>
+          ) : (
+            <>
+              <div style={{ marginBottom: '15px' }}>
+                <span style={{ opacity: 0.8, display: 'block', fontSize: '16px', textTransform: 'uppercase' }}>License Plate</span>
+                <strong style={{ fontSize: '32px', letterSpacing: '2px' }}>{result.plate_number || "—"}</strong>
+              </div>
+
+              {status === "ALREADY_PARKED" && (
+                <>
+                  <div style={{ marginBottom: '15px' }}>
+                    <span style={{ opacity: 0.8, display: 'block', fontSize: '16px', textTransform: 'uppercase' }}>Assigned Slot</span>
+                    <strong style={{ fontSize: '28px' }}>{result.slot}</strong>
+                  </div>
+                  <div style={{ marginBottom: '15px' }}>
+                    <span style={{ opacity: 0.8, display: 'block', fontSize: '16px', textTransform: 'uppercase' }}>Entry Time</span>
+                    <strong style={{ fontSize: '24px' }}>{result.direction?.replace('Already parked since ', '') || "—"}</strong>
+                  </div>
+                </>
+              )}
+
+              {status !== "ALREADY_PARKED" && (
+                <>
+                  <div style={{ marginBottom: '15px' }}>
+                    <span style={{ opacity: 0.8, display: 'block', fontSize: '16px' }}>OCR</span>
+                    <strong>{result.ocr_success ? "✓ Successfully Read" : "Failed"}</strong>
+                  </div>
+                  
+                  <div style={{ marginBottom: '15px' }}>
+                    <span style={{ opacity: 0.8, display: 'block', fontSize: '16px' }}>YOLO Confidence</span>
+                    <strong>{Math.round((result.yolo_confidence || 0) * 100)}%</strong>
+                  </div>
+
+                  <div style={{ marginBottom: '15px' }}>
+                    <span style={{ opacity: 0.8, display: 'block', fontSize: '16px' }}>Status</span>
+                    <strong>{status === 'GRANTED' ? '🟢 GRANTED' : status}</strong>
+                  </div>
+
+                  {status === "GRANTED" && (
+                    <div style={{ marginBottom: '15px' }}>
+                      <span style={{ opacity: 0.8, display: 'block', fontSize: '16px' }}>Parking Slot</span>
+                      <strong style={{ fontSize: '32px' }}>{result.slot}</strong>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
         </div>
       </section>
 
@@ -74,14 +108,14 @@ export function ResultDisplay() {
           <h3>Recognition details</h3>
           <dl>
             <dt>License plate</dt>
-            <dd>{result.plate || "—"}</dd>
+            <dd>{result.plate_number || "—"}</dd>
             <dt>Account</dt>
             <dd>{result.category || "Guest"}</dd>
             <dt>ANPR confidence</dt>
-            <dd>{Math.round((result.confidence || 0) * 100)}%</dd>
+            <dd>{Math.round((result.yolo_confidence || 0) * 100)}%</dd>
           </dl>
         </article>
-        {status === "granted" && (
+        {status === "GRANTED" && (
           <article className="card map">
             <h3>Route overview</h3>
             <div className="road">
@@ -94,14 +128,8 @@ export function ResultDisplay() {
             </p>
           </article>
         )}
-        {status !== "granted" && (
-          <article className="card map" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <p style={{ textAlign: 'center', color: '#6d7772', fontSize: '18px' }}>
-              {status === "exited" ? "Have a great day!" : "Please contact security if you need assistance."}
-            </p>
-          </article>
-        )}
       </section>
     </main>
   );
 }
+

@@ -36,17 +36,19 @@ function Metric({ label, value }: { label: string; value: number | string }) {
 }
 
 function statusTag(status: string) {
-  switch (status) {
-    case "granted":
+  switch (status.toUpperCase()) {
+    case "GRANTED":
       return <span className="tag">Granted</span>;
-    case "already_parked":
+    case "ALREADY_PARKED":
       return <span className="tag tag-reject">Already Parked</span>;
-    case "no_slot":
+    case "NO_SLOT":
       return <span className="tag tag-reject">No Slot</span>;
-    case "rejected":
+    case "REJECTED":
       return <span className="tag tag-reject">Rejected</span>;
-    case "exited":
+    case "EXITED":
       return <span className="tag tag-exit">Exited</span>;
+    case "OCR_FAILED":
+      return <span className="tag tag-reject">OCR Failed</span>;
     default:
       return <span className="tag">{status}</span>;
   }
@@ -421,7 +423,7 @@ export function Admin() {
             {history.map((row, i) => (
               <tr key={`${row.timestamp}-${i}`}>
                 <td>{formatTime(row.timestamp)}</td>
-                <td className="mono">{row.plate}</td>
+                <td className="mono">{row.plate_number}</td>
                 <td>{row.studentName}</td>
                 <td>
                   <b>{row.slot}</b> · {row.direction}

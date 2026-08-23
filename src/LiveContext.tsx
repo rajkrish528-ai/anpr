@@ -16,14 +16,17 @@ export { formatTime };
 
 // ── initial / demo state ──────────────────────────────────────
 const INITIAL: ParkingResult = {
-  plate: "BR01N2323",
+  success: true,
+  plate_detected: true,
+  ocr_success: true,
+  plate_number: "BR01N2323",
+  yolo_confidence: 0.94,
   studentName: "Aarav Kumar",
   category: "Student",
   slot: "S2",
   direction: "Level 1 · East Wing",
-  confidence: 0.94,
   source: "demo",
-  status: "granted",
+  status: "GRANTED",
   timestamp: new Date().toISOString(),
   occupied: 27,
   totalSlots: 50,

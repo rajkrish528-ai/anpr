@@ -196,9 +196,9 @@ def add_result(result: dict):
         cursor = conn.execute(
             """INSERT INTO parking_results (plate, owner_name, category, slot, direction, confidence, source, status)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (result["plate"], result["studentName"], result["category"], result["slot"],
-             result["direction"], result["confidence"], result["source"],
-             result.get("status", "granted")),
+            (result.get("plate_number", ""), result.get("studentName", "Visitor"), result.get("category", "Guest"), result.get("slot", ""),
+             result.get("direction", ""), result.get("yolo_confidence", 0.0), result.get("source", "gate"),
+             result.get("status", "GRANTED")),
         )
     result["id"] = cursor.lastrowid
     return result
@@ -214,17 +214,22 @@ def latest_result():
     return to_web_result(dict(row)) if row else None
 
 def to_web_result(row: dict):
+    plate = row["plate"]
+    ocr_success = bool(plate and plate != "UNKNOWN")
     return {
         "id": row["id"],
+        "success": True,
         "type": "parking_result",
-        "plate": row["plate"],
+        "plate_detected": True,
+        "ocr_success": ocr_success,
+        "plate_number": plate,
+        "yolo_confidence": row["confidence"],
         "studentName": row["owner_name"],
         "category": row["category"],
         "slot": row["slot"],
         "direction": row["direction"],
-        "confidence": row["confidence"],
         "source": row["source"],
-        "status": row.get("status", "granted"),
+        "status": str(row.get("status", "GRANTED")).upper(),
         "timestamp": row["created_at"].replace(" ", "T") + "+00:00",
     }
 

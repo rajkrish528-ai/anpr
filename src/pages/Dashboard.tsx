@@ -107,7 +107,7 @@ export function Dashboard() {
       <section className="card dashboard-status">
         <p className="eyebrow">LATEST LIVE ASSIGNMENT</p>
         <h2>
-          {result.plate} <span>→</span> {result.slot}
+          {result.plate_number} <span>→</span> {result.slot}
         </h2>
         <p>
           {result.studentName} · {result.direction} ·{" "}

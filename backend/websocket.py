@@ -55,43 +55,46 @@ async def broadcast(event: dict):
 # Core parking logic — entry / duplicate / exit
 # ─────────────────────────────────────────────────────────────
 
-async def create_result(plate: str, confidence: float, source: str, processed_image: str | None = None):
+async def create_result(plate_number: str, yolo_confidence: float, source: str, processed_image: str | None = None):
     """Process a detected plate through the full parking workflow.
     
     Returns the event dict or None if the plate is on cooldown.
     """
-    plate = repository.normalise_plate(plate)
-    if not plate or len(plate) < 4:
+    plate_number = repository.normalise_plate(plate_number)
+    if not plate_number or len(plate_number) < 4:
         return None
 
     now = time.time()
 
     # ── Cooldown: skip if we just processed this plate ──
-    if plate in recent_reads and (now - recent_reads[plate] < COOLDOWN_SECONDS):
-        recent_reads[plate] = now  # extend cooldown while vehicle lingers
+    if plate_number in recent_reads and (now - recent_reads[plate_number] < COOLDOWN_SECONDS):
+        recent_reads[plate_number] = now  # extend cooldown while vehicle lingers
         return None
 
-    recent_reads[plate] = now
+    recent_reads[plate_number] = now
 
     # ── Look up vehicle info ──
-    person = repository.vehicle_for_plate(plate)
+    person = repository.vehicle_for_plate(plate_number)
     settings = repository.get_settings()
     stats = repository.get_dashboard_stats()
 
     # ── Check if vehicle is already parked ──
-    active = repository.get_active_vehicle(plate)
+    active = repository.get_active_vehicle(plate_number)
 
     if active:
         # ALREADY PARKED — reject duplicate
         event = {
+            "success": True,
             "type": "parking_result",
-            "plate": plate,
+            "plate_detected": True,
+            "ocr_success": True,
+            "plate_number": plate_number,
+            "yolo_confidence": yolo_confidence,
             **person,
             "slot": active["slot_id"],
             "direction": f"Already parked since {active['entry_time'][:16]}",
-            "confidence": confidence,
             "source": source,
-            "status": "already_parked",
+            "status": "ALREADY_PARKED",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "occupied": stats["occupied"],
             "totalSlots": stats["total_slots"],
@@ -108,14 +111,17 @@ async def create_result(plate: str, confidence: float, source: str, processed_im
     if not slot_info:
         # NO SLOT AVAILABLE
         event = {
+            "success": True,
             "type": "parking_result",
-            "plate": plate,
+            "plate_detected": True,
+            "ocr_success": True,
+            "plate_number": plate_number,
+            "yolo_confidence": yolo_confidence,
             **person,
             "slot": "N/A",
             "direction": "Parking Full",
-            "confidence": confidence,
             "source": source,
-            "status": "no_slot",
+            "status": "NO_SLOT",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "occupied": stats["occupied"],
             "totalSlots": stats["total_slots"],
@@ -127,7 +133,7 @@ async def create_result(plate: str, confidence: float, source: str, processed_im
 
     # ── Park the vehicle ──
     repository.park_vehicle(
-        plate=plate,
+        plate=plate_number,
         slot_id=slot_info["slot_id"],
         owner_name=person["studentName"],
         category=person["category"],
@@ -138,14 +144,17 @@ async def create_result(plate: str, confidence: float, source: str, processed_im
     stats = repository.get_dashboard_stats()
 
     event = {
+        "success": True,
         "type": "parking_result",
-        "plate": plate,
+        "plate_detected": True,
+        "ocr_success": True,
+        "plate_number": plate_number,
+        "yolo_confidence": yolo_confidence,
         **person,
         "slot": slot_info["slot_id"],
         "direction": f"{slot_info['zone']}",
-        "confidence": confidence,
         "source": source,
-        "status": "granted",
+        "status": "GRANTED",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "occupied": stats["occupied"],
         "totalSlots": stats["total_slots"],
@@ -168,14 +177,17 @@ async def process_exit(plate: str, source: str = "manual"):
     person = repository.vehicle_for_plate(plate)
 
     event = {
+        "success": True,
         "type": "parking_result",
-        "plate": plate,
+        "plate_detected": True,
+        "ocr_success": True,
+        "plate_number": plate,
+        "yolo_confidence": 1.0,
         **person,
         "slot": history["slot_id"],
         "direction": f"Departed after {history['duration_minutes']} min",
-        "confidence": 1.0,
         "source": source,
-        "status": "exited",
+        "status": "EXITED",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "occupied": stats["occupied"],
         "totalSlots": stats["total_slots"],
@@ -197,30 +209,32 @@ def analyse_image(data_url: str):
     image = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Invalid image frame")
-    analysis = get_analyzer().analyze(image)
-    plate = next((number for number in analysis["numbers"] if number), "UNKNOWN")
-    confidence = analysis["plates"][0]["confidence"] if analysis["plates"] else 0.0
+    plate_detected = len(analysis["plates"]) > 0
+    yolo_confidence = analysis["plates"][0]["confidence"] if plate_detected else 0.0
+    plate_number = next((number for number in analysis["numbers"] if number), "")
+    ocr_success = bool(plate_number)
+    
     success, output = cv2.imencode(".jpg", analysis["image"])
     processed = f"data:image/jpeg;base64,{base64.b64encode(output).decode()}" if success else None
     is_stable = False
     now = time.time()
     
-    if plate != "UNKNOWN":
-        if plate not in temporal_buffer:
-            temporal_buffer[plate] = []
-        temporal_buffer[plate].append(now)
+    if plate_number:
+        if plate_number not in temporal_buffer:
+            temporal_buffer[plate_number] = []
+        temporal_buffer[plate_number].append(now)
         
-        temporal_buffer[plate] = [t for t in temporal_buffer[plate] if (now - t) <= STABILIZATION_WINDOW_SECONDS]
+        temporal_buffer[plate_number] = [t for t in temporal_buffer[plate_number] if (now - t) <= STABILIZATION_WINDOW_SECONDS]
         
-        if len(temporal_buffer[plate]) >= STABILIZATION_REQUIRED_READS:
+        if len(temporal_buffer[plate_number]) >= STABILIZATION_REQUIRED_READS:
             is_stable = True
-            temporal_buffer[plate] = []
+            temporal_buffer[plate_number] = []
             
     stale_plates = [p for p, times in temporal_buffer.items() if not times or (now - times[-1]) > STABILIZATION_WINDOW_SECONDS]
     for p in stale_plates:
         del temporal_buffer[p]
 
-    return plate, confidence, processed, is_stable
+    return plate_detected, plate_number, yolo_confidence, ocr_success, processed, is_stable
 
 
 async def handle_socket(websocket: WebSocket, expected_source: str | None = None):
@@ -234,9 +248,24 @@ async def handle_socket(websocket: WebSocket, expected_source: str | None = None
                 continue
             if kind == "frame":
                 source = expected_source or data.get("source", "gate")
-                plate, confidence, processed, is_stable = await asyncio.to_thread(analyse_image, data["image"])
-                if plate != "UNKNOWN" and is_stable:
-                    await create_result(plate, confidence, source, processed)
+                plate_detected, plate_number, yolo_confidence, ocr_success, processed, is_stable = await asyncio.to_thread(analyse_image, data["image"])
+                
+                if plate_detected and not ocr_success:
+                    # Emit OCR failed status
+                    await broadcast({
+                        "success": False,
+                        "type": "parking_result",
+                        "plate_detected": True,
+                        "ocr_success": False,
+                        "plate_number": "",
+                        "yolo_confidence": yolo_confidence,
+                        "source": source,
+                        "status": "OCR_FAILED",
+                        "processedImage": processed,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                elif plate_detected and ocr_success and is_stable:
+                    await create_result(plate_number, yolo_confidence, source, processed)
             elif kind == "manual_check":
                 await create_result(repository.normalise_plate(data["plate"]), 1.0, "manual")
             elif kind == "manual_exit":
@@ -281,34 +310,36 @@ def _encode_frame_as_dataurl(frame):
 def process_camera_frame(frame):
     """Run full YOLO + OCR analysis on a frame. Returns (plate, confidence, processed, is_stable)."""
     analysis = get_analyzer().analyze(frame)
-    plate = next((number for number in analysis["numbers"] if number), "UNKNOWN")
-    confidence = analysis["plates"][0]["confidence"] if analysis["plates"] else 0.0
+    plate_detected = len(analysis["plates"]) > 0
+    yolo_confidence = analysis["plates"][0]["confidence"] if plate_detected else 0.0
+    plate_number = next((number for number in analysis["numbers"] if number), "")
+    ocr_success = bool(plate_number)
     processed = _encode_frame_as_dataurl(analysis["image"])
     
     is_stable = False
     now = time.time()
     
-    if plate != "UNKNOWN":
+    if plate_number:
         # Add to temporal buffer
-        if plate not in temporal_buffer:
-            temporal_buffer[plate] = []
-        temporal_buffer[plate].append(now)
+        if plate_number not in temporal_buffer:
+            temporal_buffer[plate_number] = []
+        temporal_buffer[plate_number].append(now)
         
         # Clean up old entries outside the window
-        temporal_buffer[plate] = [t for t in temporal_buffer[plate] if (now - t) <= STABILIZATION_WINDOW_SECONDS]
+        temporal_buffer[plate_number] = [t for t in temporal_buffer[plate_number] if (now - t) <= STABILIZATION_WINDOW_SECONDS]
         
         # Check if we have enough reads to consider it stable
-        if len(temporal_buffer[plate]) >= STABILIZATION_REQUIRED_READS:
+        if len(temporal_buffer[plate_number]) >= STABILIZATION_REQUIRED_READS:
             is_stable = True
             # Clear buffer for this plate so we don't keep firing
-            temporal_buffer[plate] = []
+            temporal_buffer[plate_number] = []
             
     # Clean up completely stale plates from memory
     stale_plates = [p for p, times in temporal_buffer.items() if not times or (now - times[-1]) > STABILIZATION_WINDOW_SECONDS]
     for p in stale_plates:
         del temporal_buffer[p]
 
-    return plate, confidence, processed, is_stable
+    return plate_detected, plate_number, yolo_confidence, ocr_success, processed, is_stable
 
 # How often to run full YOLO+OCR (every Nth frame).
 ANALYZE_EVERY_N_FRAMES = 5
@@ -367,14 +398,33 @@ async def configured_camera_stream(websocket: WebSocket, role: str):
                 frame_counter += 1
 
                 if frame_counter % ANALYZE_EVERY_N_FRAMES == 0:
-                    plate, confidence, processed, is_stable = await asyncio.to_thread(process_camera_frame, frame)
+                    plate_detected, plate_number, yolo_confidence, ocr_success, processed, is_stable = await asyncio.to_thread(process_camera_frame, frame)
                     await websocket.send_json({
                         "type": "camera_frame", "source": role, "processedImage": processed,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
-                    # ONLY allocate parking if the plate read is stable across multiple frames
-                    if plate != "UNKNOWN" and is_stable:
-                        await create_result(plate, confidence, role, processed)
+                    if plate_detected and not ocr_success:
+                        # OCR Failed warning
+                        now = time.time()
+                        if now - recent_reads.get("_OCR_FAILED_", 0) > COOLDOWN_SECONDS:
+                            recent_reads["_OCR_FAILED_"] = now
+                            event = {
+                                "success": False,
+                                "type": "parking_result",
+                                "plate_detected": True,
+                                "ocr_success": False,
+                                "plate_number": "",
+                                "yolo_confidence": yolo_confidence,
+                                "source": role,
+                                "status": "OCR_FAILED",
+                                "processedImage": processed,
+                                "timestamp": datetime.now(timezone.utc).isoformat()
+                            }
+                            repository.add_result(event)
+                            await broadcast(event)
+                    elif plate_detected and ocr_success and is_stable:
+                        # ONLY allocate parking if the plate read is stable across multiple frames
+                        await create_result(plate_number, yolo_confidence, role, processed)
                 else:
                     raw = await asyncio.to_thread(_encode_frame_as_dataurl, frame)
                     await websocket.send_json({
