@@ -23,7 +23,7 @@ class LicensePlateAnalyzer:
         self,
         vehicle_model_path="yolo11n.pt",
         model_path="models/best.pt",
-        confidence=0.40,
+        confidence=0.30,
         tesseract_path=None,
     ):
         self.vehicle_model_path = vehicle_model_path
