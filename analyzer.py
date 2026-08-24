@@ -90,39 +90,47 @@ class LicensePlateAnalyzer:
     # Preprocessing for Tesseract
     # ──────────────────────────────────────────────────────────
 
-    def get_preprocessing_variants(self, plate_image):
-        """Create multiple variants of the plate image to give Tesseract the best chance."""
+    def get_preprocessing_variants(self, plate_image, fast: bool = False):
+        """Create variants of the plate image for Tesseract.
+
+        fast=True  → 2 variants only (live camera, low latency).
+        fast=False → 5 variants (uploaded image, maximum accuracy).
+        """
         if plate_image is None or plate_image.size == 0:
             return []
 
         variants = []
-        
-        # 1. Original + grayscale
+
+        # 1. Original grayscale (fastest; good for clean, well-lit plates)
         gray_original = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
         variants.append(("original_gray", gray_original))
-        
-        # Upscale
+
+        # Adaptive upscale: 3× for small crops, 2× for already-large crops
         h, w = plate_image.shape[:2]
-        upscaled = cv2.resize(plate_image, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+        scale = 3 if max(w, h) < 200 else 2
+        upscaled = cv2.resize(plate_image, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray_upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
-        
-        # 2. Upscaled + grayscale
+
+        # 2. Upscaled grayscale (usually best for clean Indian plates)
         variants.append(("upscaled_gray", gray_upscaled))
-        
-        # 3. Upscaled + threshold
-        gray_blur = cv2.bilateralFilter(gray_upscaled, 9, 75, 75)
-        gray_eq = cv2.equalizeHist(gray_blur)
-        _, thresh_otsu = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(("upscaled_thresh", thresh_otsu))
-        
-        # 4. Upscaled + adaptive threshold
+
+        if fast:
+            return variants  # 2 variants ≈ 2 Tesseract calls — fast enough for live camera
+
+        # 3. CLAHE + Otsu threshold (better than equalizeHist for uneven lighting)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_clahe = clahe.apply(gray_upscaled)
+        _, thresh_clahe = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(("clahe_thresh", thresh_clahe))
+
+        # 4. Adaptive threshold (handles shadows / non-uniform background)
         thresh_adaptive = cv2.adaptiveThreshold(
-            gray_upscaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            gray_upscaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
         )
         variants.append(("upscaled_adaptive", thresh_adaptive))
-        
-        # 5. Sharpened + threshold
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+
+        # 5. Sharpened + Otsu (helps slightly blurred characters)
+        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
         sharpened = cv2.filter2D(gray_upscaled, -1, kernel)
         _, thresh_sharp = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(("sharpened_thresh", thresh_sharp))
@@ -133,35 +141,44 @@ class LicensePlateAnalyzer:
     # Tesseract OCR
     # ──────────────────────────────────────────────────────────
 
-    def read_plate(self, plate_image):
+    def read_plate(self, plate_image, fast: bool = False):
         """Read text from a cropped plate image using multiple strategies.
-        Returns (best_normalized_text, confidence, raw_text)."""
+        Returns (best_normalized_text, confidence, raw_text).
+
+        fast=True uses only 2 variants × 1 config = 2 Tesseract calls (live camera).
+        fast=False uses up to 5 variants × 3 configs = 15 calls (test image).
+        """
         if not self.ocr_loaded:
             if DEBUG_ANPR: print("[OCR] Failed: Tesseract not loaded")
             return "", 0.0, ""
 
-        variants = self.get_preprocessing_variants(plate_image)
+        variants = self.get_preprocessing_variants(plate_image, fast=fast)
         if not variants:
             if DEBUG_ANPR: print("[OCR] Failed: No image variants generated")
             return "", 0.0, ""
 
-        configs = [
-            "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", # Single line
-            "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", # Uniform block (2 lines)
-            "--psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" # Sparse text
+        # --oem 3 = LSTM neural network only (more accurate than legacy engine)
+        all_configs = [
+            "--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",  # single line
+            "--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",  # uniform block
+            "--oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", # sparse text
         ]
+        configs = all_configs[:1] if fast else all_configs  # fast: 1 config, thorough: 3 configs
 
         best_plate = ""
         best_conf = 0.0
         best_raw = ""
         best_variant = ""
 
-        # Loop through all variants and configs to find the highest confidence valid read
         for variant_name, img in variants:
             for config in configs:
-                raw_text = pytesseract.image_to_string(img, config=config).strip()
+                try:
+                    raw_text = pytesseract.image_to_string(img, config=config).strip()
+                except Exception as e:
+                    if DEBUG_ANPR: print(f"  [OCR] Tesseract error on {variant_name}: {e}")
+                    continue
+
                 normalized = self.normalize_plate_number(raw_text)
-                
                 valid_plate = self.validate_plate(normalized)
                 if not valid_plate:
                     continue
@@ -172,22 +189,19 @@ class LicensePlateAnalyzer:
                     conf = (sum(confs) / len(confs) / 100.0) if confs else 0.5
                 except Exception:
                     conf = 0.5
-                    
+
                 if DEBUG_ANPR:
-                    print(f"  [OCR-TEST] Variant: {variant_name}, PSM: {config[:8]}, Raw: '{raw_text}', Norm: '{normalized}', Conf: {conf:.2f}")
+                    print(f"  [OCR-TEST] Variant: {variant_name}, PSM: {config[7:13]}, Raw: '{raw_text}', Norm: '{normalized}', Conf: {conf:.2f}")
 
                 if conf > best_conf:
                     best_conf = conf
                     best_plate = valid_plate
                     best_raw = raw_text
                     best_variant = variant_name
-
-                    # Save the variant that worked best
                     if DEBUG_ANPR:
                         cv2.imwrite(os.path.join(DEBUG_DIR, "latest_processed_plate.jpg"), img)
 
-                # Early exit if we get a very high confidence read
-                if best_conf > 0.85:
+                if best_conf > 0.85:  # early exit on very high confidence
                     break
             if best_conf > 0.85:
                 break
@@ -203,19 +217,23 @@ class LicensePlateAnalyzer:
     # Full analysis pipeline
     # ──────────────────────────────────────────────────────────
 
-    def analyze(self, image):
-        """Run full ANPR pipeline on a single frame."""
+    def analyze(self, image, fast: bool = False):
+        """Run full ANPR pipeline on a single frame.
+
+        fast=True  → use 2-variant OCR for live camera (low latency).
+        fast=False → use 5-variant OCR for maximum accuracy.
+        """
         if image is None:
             raise ValueError("Image cannot be None.")
 
         output_image = image.copy()
         h, w = image.shape[:2]
-        
+
         if DEBUG_ANPR:
             print("\n" + "="*50)
-            print(f"[ANPR] Analyzing new frame ({w}x{h})")
+            print(f"[ANPR] Analyzing new frame ({w}x{h}){' [fast]' if fast else ''}")
 
-        # 1. Detect and draw vehicles
+        # 1. Detect vehicles
         vehicle_results = self.vehicle_model(image, conf=0.25, verbose=False)
         vehicles = []
         for result in vehicle_results:
@@ -239,10 +257,11 @@ class LicensePlateAnalyzer:
                     "vehicle_confidence": round(float(conf), 3),
                 })
 
-        # 2. Detect plates on the FULL image
+        # 2. Detect plates — collect all, pick the best (highest confidence × area)
         plates = []
         numbers = []
 
+        all_plate_boxes = []
         plate_results = self.plate_model(image, conf=self.confidence, verbose=False)
         for plate_result in plate_results:
             if plate_result.boxes is None:
@@ -250,53 +269,66 @@ class LicensePlateAnalyzer:
             for box, conf in zip(plate_result.boxes.xyxy, plate_result.boxes.conf):
                 px1, py1, px2, py2 = map(int, box)
                 plate_confidence = float(conf)
-                
+                area = (px2 - px1) * (py2 - py1)
+                score = plate_confidence * (area / max(1, w * h))
+                all_plate_boxes.append({
+                    "bbox": (px1, py1, px2, py2),
+                    "confidence": plate_confidence,
+                    "area": area,
+                    "score": score,
+                })
+                plates.append({"confidence": plate_confidence})
+
+        # Sort best-first; draw dim boxes for non-primary
+        all_plate_boxes.sort(key=lambda d: d["score"], reverse=True)
+        for det in all_plate_boxes[1:]:
+            px1, py1, px2, py2 = det["bbox"]
+            cv2.rectangle(output_image, (px1, py1), (px2, py2), (128, 128, 128), 1)
+
+        if all_plate_boxes:
+            primary = all_plate_boxes[0]
+            px1, py1, px2, py2 = primary["bbox"]
+            plate_confidence = primary["confidence"]
+
+            if DEBUG_ANPR:
+                print(f"[ANPR] Best plate: bbox={px1},{py1},{px2},{py2} conf={plate_confidence:.2f} score={primary['score']:.4f}")
+
+            # Proportional padding: 10% of bbox dimension, min 10px
+            bw = max(1, px2 - px1)
+            bh = max(1, py2 - py1)
+            pad_x = max(10, int(0.10 * bw))
+            pad_y = max(6, int(0.08 * bh))
+
+            cx1 = max(0, px1 - pad_x)
+            cy1 = max(0, py1 - pad_y)
+            cx2 = min(w, px2 + pad_x)
+            cy2 = min(h, py2 + pad_y)
+
+            plate_crop = image[cy1:cy2, cx1:cx2]
+            crop_h, crop_w = plate_crop.shape[:2]
+
+            if DEBUG_ANPR:
+                print(f"[CROP] {crop_w}x{crop_h} (padded from {bw}x{bh})")
+                cv2.imwrite(os.path.join(DEBUG_DIR, "latest_plate.jpg"), plate_crop)
+
+            if crop_w < 40 or crop_h < 15:
                 if DEBUG_ANPR:
-                    print(f"[ANPR] YOLO detected plate")
-                    print(f"       Bounding box: {px1},{py1},{px2},{py2}")
-                    print(f"       Confidence: {plate_confidence:.2f}")
+                    print("[CROP] Plate too small for reliable OCR. Skipping.")
+                cv2.rectangle(output_image, (px1, py1), (px2, py2), (0, 165, 255), 2)
+                cv2.putText(output_image, "TOO SMALL", (px1, py1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            else:
+                plate_number, ocr_confidence, raw_text = self.read_plate(plate_crop, fast=fast)
 
-                # Configurable padding
-                padding = 10
-                cx1 = max(0, px1 - padding)
-                cy1 = max(0, py1 - padding)
-                cx2 = min(w, px2 + padding)
-                cy2 = min(h, py2 + padding)
-
-                plate_crop = image[cy1:cy2, cx1:cx2]
-                
-                crop_h, crop_w = plate_crop.shape[:2]
-                if DEBUG_ANPR:
-                    print(f"[CROP] Width: {crop_w}, Height: {crop_h}")
-                    cv2.imwrite(os.path.join(DEBUG_DIR, "latest_plate.jpg"), plate_crop)
-
-                if crop_w < 40 or crop_h < 15:
-                    if DEBUG_ANPR:
-                        print("[CROP] Plate too small for reliable OCR. Skipping.")
-                    # Draw orange box to indicate detection but skipped OCR
-                    cv2.rectangle(output_image, (px1, py1), (px2, py2), (0, 165, 255), 2)
-                    cv2.putText(output_image, "TOO SMALL", (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                    plates.append({"confidence": plate_confidence})
-                    continue
-
-                # Run OCR
-                plate_number, ocr_confidence, raw_text = self.read_plate(plate_crop)
-
-                # Draw bounding box — green if OCR succeeded, orange if plate detected but OCR failed
                 color = (0, 255, 0) if plate_number else (0, 165, 255)
                 cv2.rectangle(output_image, (px1, py1), (px2, py2), color, 2)
-
-                label = f"{plate_number} {ocr_confidence:.0%}" if plate_number else f"plate {plate_confidence:.2f}"
-                cv2.putText(
-                    output_image, label,
-                    (px1, py1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, color, 2,
-                )
+                label = (f"{plate_number} {ocr_confidence:.0%}" if plate_number
+                         else f"plate {plate_confidence:.2f}")
+                cv2.putText(output_image, label, (px1, py1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
                 if plate_number:
                     numbers.append(plate_number)
-                plates.append({"confidence": plate_confidence})
 
         return {
             "image": output_image,
@@ -327,12 +359,15 @@ class LicensePlateAnalyzer:
     def analyze_with_crops(self, image):
         """Run full ANPR pipeline and also return base64-encoded crop images.
 
-        Returns a dict with all analyze() keys plus:
-          - original_crop: data-URL of the raw plate crop (or None)
-          - preprocessed_crop: data-URL of the best preprocessed image fed to OCR (or None)
-          - ocr_confidence: float 0..1 (or 0.0)
-          - ocr_engine: str
-          - is_valid_indian_format: bool
+        KEY FIX: Instead of 'last detection wins', this method collects ALL
+        plate detections, ranks them by (confidence × bbox_area / image_area),
+        and uses only the TOP-RANKED detection for the crop and OCR.  This
+        prevents the small 'IND' badge box (or any secondary detection) from
+        overwriting the crop from the full plate box.
+
+        Returns the analyze() keys plus:
+          original_crop, preprocessed_crop, ocr_confidence,
+          ocr_engine, is_valid_indian_format.
         """
         if image is None:
             raise ValueError("Image cannot be None.")
@@ -342,9 +377,9 @@ class LicensePlateAnalyzer:
 
         if DEBUG_ANPR:
             print("\n" + "="*50)
-            print(f"[ANPR] analyze_with_crops — frame ({w}x{h})")
+            print(f"[ANPR] analyze_with_crops ({w}x{h})")
 
-        # ── 1. Detect vehicles ──────────────────────────────────
+        # ── 1. Vehicle detection ──────────────────────────────────────────
         vehicle_results = self.vehicle_model(image, conf=0.25, verbose=False)
         vehicles = []
         for result in vehicle_results:
@@ -368,7 +403,7 @@ class LicensePlateAnalyzer:
                     "vehicle_confidence": round(float(conf), 3),
                 })
 
-        # ── 2. Detect plates ────────────────────────────────────
+        # ── 2. Plate detection — collect ALL, rank by score ─────────────────
         plates = []
         numbers = []
         best_plate_number = ""
@@ -377,6 +412,7 @@ class LicensePlateAnalyzer:
         original_crop_b64 = None
         preprocessed_crop_b64 = None
 
+        all_detections = []
         plate_results = self.plate_model(image, conf=self.confidence, verbose=False)
         for plate_result in plate_results:
             if plate_result.boxes is None:
@@ -384,38 +420,74 @@ class LicensePlateAnalyzer:
             for box, conf in zip(plate_result.boxes.xyxy, plate_result.boxes.conf):
                 px1, py1, px2, py2 = map(int, box)
                 plate_confidence = float(conf)
+                area = (px2 - px1) * (py2 - py1)
+                # Score = confidence × normalised area (prefers large confident boxes)
+                score = plate_confidence * (area / max(1, w * h))
+                all_detections.append({
+                    "bbox": (px1, py1, px2, py2),
+                    "confidence": plate_confidence,
+                    "area": area,
+                    "score": score,
+                })
+                plates.append({"confidence": plate_confidence})
 
-                if plate_confidence > best_yolo_confidence:
-                    best_yolo_confidence = plate_confidence
+        # Sort best-first
+        all_detections.sort(key=lambda d: d["score"], reverse=True)
 
-                padding = 10
-                cx1 = max(0, px1 - padding)
-                cy1 = max(0, py1 - padding)
-                cx2 = min(w, px2 + padding)
-                cy2 = min(h, py2 + padding)
+        if DEBUG_ANPR:
+            for i, det in enumerate(all_detections):
+                px1, py1, px2, py2 = det["bbox"]
+                print(f"[DETECT] #{i} bbox=({px1},{py1},{px2},{py2}) conf={det['confidence']:.2f} area={det['area']} score={det['score']:.5f}")
 
-                plate_crop = image[cy1:cy2, cx1:cx2]
-                crop_h, crop_w = plate_crop.shape[:2]
+        # Draw secondary (non-primary) detections as dim grey
+        for det in all_detections[1:]:
+            px1, py1, px2, py2 = det["bbox"]
+            cv2.rectangle(output_image, (px1, py1), (px2, py2), (128, 128, 128), 1)
 
+        # ── 3. Process ONLY the primary (best-scored) detection ────────────
+        if all_detections:
+            primary = all_detections[0]
+            px1, py1, px2, py2 = primary["bbox"]
+            plate_confidence = primary["confidence"]
+            best_yolo_confidence = plate_confidence
+
+            if DEBUG_ANPR:
+                print(f"[PRIMARY] bbox=({px1},{py1},{px2},{py2}) conf={plate_confidence:.2f}")
+
+            # Proportional padding: 10% of bbox width / 8% of height, min 15/8 px
+            bw = max(1, px2 - px1)
+            bh = max(1, py2 - py1)
+            pad_x = max(15, int(0.10 * bw))
+            pad_y = max(8,  int(0.08 * bh))
+
+            cx1 = max(0, px1 - pad_x)
+            cy1 = max(0, py1 - pad_y)
+            cx2 = min(w, px2 + pad_x)
+            cy2 = min(h, py2 + pad_y)
+
+            plate_crop = image[cy1:cy2, cx1:cx2]
+            crop_h, crop_w = plate_crop.shape[:2]
+
+            if DEBUG_ANPR:
+                print(f"[CROP] raw bbox {bw}x{bh} → padded crop {crop_w}x{crop_h} (pad_x={pad_x}, pad_y={pad_y})")
+                cv2.imwrite(os.path.join(DEBUG_DIR, "latest_plate.jpg"), plate_crop)
+
+            # Always encode the raw crop (for display)
+            ok_raw, raw_enc = cv2.imencode(".jpg", plate_crop)
+            if ok_raw:
+                original_crop_b64 = f"data:image/jpeg;base64,{base64.b64encode(raw_enc).decode()}"
+
+            if crop_w < 40 or crop_h < 15:
                 if DEBUG_ANPR:
-                    print(f"[CROP] {crop_w}x{crop_h}, YOLO conf={plate_confidence:.2f}")
+                    print("[CROP] Too small for OCR — skipping.")
+                cv2.rectangle(output_image, (px1, py1), (px2, py2), (0, 165, 255), 2)
+                cv2.putText(output_image, "TOO SMALL", (px1, py1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            else:
+                # Run multi-variant OCR (full 5-variant mode — no fast shortcut for test images)
+                plate_number, ocr_conf, _ = self.read_plate(plate_crop, fast=False)
 
-                # Encode raw crop as base64 (always, even if too small for OCR)
-                ok_raw, raw_enc = cv2.imencode(".jpg", plate_crop)
-                if ok_raw:
-                    original_crop_b64 = f"data:image/jpeg;base64,{base64.b64encode(raw_enc).decode()}"
-
-                if crop_w < 40 or crop_h < 15:
-                    cv2.rectangle(output_image, (px1, py1), (px2, py2), (0, 165, 255), 2)
-                    cv2.putText(output_image, "TOO SMALL", (px1, py1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                    plates.append({"confidence": plate_confidence})
-                    continue
-
-                # Run multi-variant OCR and capture the best preprocessed image
-                plate_number, ocr_conf, _ = self.read_plate(plate_crop)
-
-                # Capture the best preprocessed variant as base64
+                # Capture the preprocessed image that gave the best OCR result
                 preprocessed_path = os.path.join(DEBUG_DIR, "latest_processed_plate.jpg")
                 if os.path.exists(preprocessed_path):
                     prep_img = cv2.imread(preprocessed_path)
@@ -426,29 +498,27 @@ class LicensePlateAnalyzer:
 
                 color = (0, 255, 0) if plate_number else (0, 165, 255)
                 cv2.rectangle(output_image, (px1, py1), (px2, py2), color, 2)
-                label = f"{plate_number} {ocr_conf:.0%}" if plate_number else f"plate {plate_confidence:.2f}"
+                label = (f"{plate_number} {ocr_conf:.0%}" if plate_number
+                         else f"plate {plate_confidence:.2f}")
                 cv2.putText(output_image, label, (px1, py1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
                 if plate_number:
                     numbers.append(plate_number)
-                    if ocr_conf > best_ocr_confidence:
-                        best_ocr_confidence = ocr_conf
-                        best_plate_number = plate_number
+                    best_plate_number = plate_number
+                    best_ocr_confidence = ocr_conf
 
-                plates.append({"confidence": plate_confidence})
-
-        # ── 3. Encode processed image ───────────────────────────
+        # ── 4. Encode full annotated output image ───────────────────────
         ok_out, out_enc = cv2.imencode(".jpg", output_image)
         processed_b64 = (
             f"data:image/jpeg;base64,{base64.b64encode(out_enc).decode()}"
             if ok_out else None
         )
 
-        # ── 4. Indian plate format validation ──────────────────
-        # Pattern: 2 letters + 2 digits + optional 1-2 letters + 4 digits  (e.g. MH12AB1234)
+        # ── 5. Indian plate format validation ────────────────────────
+        # Pattern covers: GJ01HU6963 / DL14TE5182 / MH12AB1234 / KA01MX5678
         indian_pattern = re.compile(
-            r"^[A-Z]{2}[0-9]{2}[A-Z]{0,3}[0-9]{4}$"
+            r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}$"
         )
         is_valid_indian = bool(best_plate_number and indian_pattern.match(best_plate_number))
 
@@ -466,3 +536,4 @@ class LicensePlateAnalyzer:
             "ocr_engine": "Tesseract OCR",
             "is_valid_indian_format": is_valid_indian,
         }
+

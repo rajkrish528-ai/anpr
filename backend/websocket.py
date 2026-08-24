@@ -310,8 +310,12 @@ def _encode_frame_as_dataurl(frame):
     return f"data:image/jpeg;base64,{base64.b64encode(encoded).decode()}"
 
 def process_camera_frame(frame):
-    """Run full YOLO + OCR analysis on a frame. Returns (plate, confidence, processed, is_stable)."""
-    analysis = get_analyzer().analyze(frame)
+    """Run full YOLO + OCR analysis on a frame. Returns (plate, confidence, processed, is_stable).
+    
+    Uses fast=True OCR (2 variants, 1 PSM) for low latency. The uploaded-image
+    endpoint uses the full 5-variant / 3-PSM path for maximum accuracy.
+    """
+    analysis = get_analyzer().analyze(frame, fast=True)
     plate_detected = len(analysis["plates"]) > 0
     yolo_confidence = analysis["plates"][0]["confidence"] if plate_detected else 0.0
     plate_number = next((number for number in analysis["numbers"] if number), "")
