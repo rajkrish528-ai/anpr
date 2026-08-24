@@ -78,12 +78,19 @@ class LicensePlateAnalyzer:
         return text
 
     def validate_plate(self, text: str):
-        """Do not accept garbage OCR. Ensure it looks somewhat like a plate."""
+        """Reject garbage OCR. A valid plate must:
+        - Be 6-13 characters (Indian plates are 8-10; relax to 6 minimum to handle partial reads)
+        - Contain at LEAST 2 digits  (state code NN + district NN = always digits present)
+        - Contain at LEAST 2 letters (state code = 2 letters minimum)
+        Returns the cleaned text or empty string.
+        """
         text = self.normalize_plate_number(text)
-        # Indian plates generally have at least 4 chars (e.g. up to 10 chars like MH12AB1234)
-        # We enforce a reasonable minimum to drop garbage like "ABC" or "123"
-        if len(text) < 4 or len(text) > 13:
+        if len(text) < 6 or len(text) > 13:
             return ""
+        digit_count = sum(1 for c in text if c.isdigit())
+        alpha_count = sum(1 for c in text if c.isalpha())
+        if digit_count < 2 or alpha_count < 2:
+            return ""  # 'NDLJB' (0 digits), '12345678' (0 letters) — both rejected
         return text
 
     # ──────────────────────────────────────────────────────────
@@ -93,47 +100,71 @@ class LicensePlateAnalyzer:
     def get_preprocessing_variants(self, plate_image, fast: bool = False):
         """Create variants of the plate image for Tesseract.
 
-        fast=True  → 2 variants only (live camera, low latency).
+        fast=True  → 2 variants (live camera, low latency).
         fast=False → 5 variants (uploaded image, maximum accuracy).
+
+        Key design choices:
+        - NEVER binarize large crops (>400px) with aggressive threshold.
+          Tesseract's internal binarization handles that better.
+        - Upscale only when the crop is too small (<150px wide).
+        - Bilateral filter denoises while keeping character edges sharp.
+        - CLAHE enhances local contrast without destroying character shape.
         """
         if plate_image is None or plate_image.size == 0:
             return []
 
+        h, w = plate_image.shape[:2]
         variants = []
 
-        # 1. Original grayscale (fastest; good for clean, well-lit plates)
+        # ── Choose upscale factor based on actual crop size ──
+        # Large crops (phone photo, full-frame car) need NO upscaling;
+        # tiny crops (small surveillance frame) need 3×.
+        if max(w, h) >= 400:
+            scale = 1   # already large and clear
+        elif max(w, h) >= 150:
+            scale = 2
+        else:
+            scale = 3
+
+        # Produce scaled-up colour image and its grayscale
+        if scale > 1:
+            upscaled = cv2.resize(plate_image, (w * scale, h * scale),
+                                  interpolation=cv2.INTER_CUBIC)
+        else:
+            upscaled = plate_image  # no copy needed — read-only below
+        gray_upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+
+        # 1. Original grayscale (fastest; best for clean, high-resolution plates)
         gray_original = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
         variants.append(("original_gray", gray_original))
 
-        # Adaptive upscale: 3× for small crops, 2× for already-large crops
-        h, w = plate_image.shape[:2]
-        scale = 3 if max(w, h) < 200 else 2
-        upscaled = cv2.resize(plate_image, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-        gray_upscaled = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
-
-        # 2. Upscaled grayscale (usually best for clean Indian plates)
+        # 2. Scaled grayscale (same as #1 when scale=1)
         variants.append(("upscaled_gray", gray_upscaled))
 
         if fast:
-            return variants  # 2 variants ≈ 2 Tesseract calls — fast enough for live camera
+            return variants  # 2 variants ≈ 2 Tesseract calls for camera
 
-        # 3. CLAHE + Otsu threshold (better than equalizeHist for uneven lighting)
+        # 3. CLAHE-enhanced grayscale — NO binarization.
+        #    CLAHE boosts local contrast; Tesseract's own binarizer handles the rest.
+        #    Replacing the old CLAHE+Otsu which destroyed characters at large scales.
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray_clahe = clahe.apply(gray_upscaled)
-        _, thresh_clahe = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(("clahe_thresh", thresh_clahe))
+        variants.append(("clahe_gray", gray_clahe))
 
-        # 4. Adaptive threshold (handles shadows / non-uniform background)
+        # 4. Bilateral-denoised grayscale
+        #    Smooths noise while preserving sharp character edges.
+        #    Replaces sharpened_thresh which amplified noise at large scales
+        #    and caused Tesseract to confidently read garbage patterns.
+        gray_bilateral = cv2.bilateralFilter(gray_upscaled, d=9, sigmaColor=50, sigmaSpace=50)
+        variants.append(("bilateral_gray", gray_bilateral))
+
+        # 5. Adaptive threshold (useful when lighting is uneven across the plate)
+        #    Only applied AFTER bilateral denoising to avoid amplifying noise.
+        gray_denoised = cv2.GaussianBlur(gray_upscaled, (3, 3), 0)
         thresh_adaptive = cv2.adaptiveThreshold(
-            gray_upscaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
+            gray_denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4
         )
-        variants.append(("upscaled_adaptive", thresh_adaptive))
-
-        # 5. Sharpened + Otsu (helps slightly blurred characters)
-        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-        sharpened = cv2.filter2D(gray_upscaled, -1, kernel)
-        _, thresh_sharp = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(("sharpened_thresh", thresh_sharp))
+        variants.append(("adaptive_thresh", thresh_adaptive))
 
         return variants
 
@@ -142,11 +173,17 @@ class LicensePlateAnalyzer:
     # ──────────────────────────────────────────────────────────
 
     def read_plate(self, plate_image, fast: bool = False):
-        """Read text from a cropped plate image using multiple strategies.
+        """Read text from a cropped plate image using multiple preprocessing strategies.
         Returns (best_normalized_text, confidence, raw_text).
 
-        fast=True uses only 2 variants × 1 config = 2 Tesseract calls (live camera).
-        fast=False uses up to 5 variants × 3 configs = 15 calls (test image).
+        Scoring uses OCR confidence WEIGHTED by Indian plate format match:
+          - Results matching Indian registration pattern get a 2× score bonus.
+          - Results with 8-10 chars (typical Indian plate) get a slight length bonus.
+        This prevents short garbage strings (e.g. 'NDLJB') from winning over
+        partially-correct but format-like reads (e.g. 'GJ01HU696').
+
+        fast=True  → 2 variants × 1 PSM = 2 Tesseract calls (live camera).
+        fast=False → 5 variants × 3 PSMs = up to 15 calls (uploaded image).
         """
         if not self.ocr_loaded:
             if DEBUG_ANPR: print("[OCR] Failed: Tesseract not loaded")
@@ -157,25 +194,34 @@ class LicensePlateAnalyzer:
             if DEBUG_ANPR: print("[OCR] Failed: No image variants generated")
             return "", 0.0, ""
 
-        # --oem 3 = LSTM neural network only (more accurate than legacy engine)
+        # PSM 7  = single text line   (best for one-line plates)
+        # PSM 8  = single word        (good for licence plates with no spaces)
+        # PSM 6  = uniform block      (fallback for two-line plates)
+        # --oem 3 = LSTM neural engine (more accurate than legacy)
         all_configs = [
-            "--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",  # single line
-            "--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",  # uniform block
-            "--oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", # sparse text
+            "--oem 3 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
         ]
-        configs = all_configs[:1] if fast else all_configs  # fast: 1 config, thorough: 3 configs
+        configs = all_configs[:1] if fast else all_configs
+
+        # Indian plate pattern for format-weighted scoring
+        # Covers: GJ01HU6963 / DL14TE5184 / MH12AB1234 / KA01MX5678 / HR26AY3232
+        _indian_re = re.compile(r"^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}$")
 
         best_plate = ""
         best_conf = 0.0
         best_raw = ""
         best_variant = ""
+        best_weighted = 0.0  # weighted score used for selection
 
         for variant_name, img in variants:
             for config in configs:
                 try:
                     raw_text = pytesseract.image_to_string(img, config=config).strip()
-                except Exception as e:
-                    if DEBUG_ANPR: print(f"  [OCR] Tesseract error on {variant_name}: {e}")
+                except Exception as exc:
+                    if DEBUG_ANPR:
+                        print(f"  [OCR] Tesseract error on {variant_name}: {exc}")
                     continue
 
                 normalized = self.normalize_plate_number(raw_text)
@@ -184,32 +230,48 @@ class LicensePlateAnalyzer:
                     continue
 
                 try:
-                    data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
+                    data = pytesseract.image_to_data(
+                        img, config=config, output_type=pytesseract.Output.DICT
+                    )
                     confs = [int(c) for c in data["conf"] if int(c) > 0]
                     conf = (sum(confs) / len(confs) / 100.0) if confs else 0.5
                 except Exception:
                     conf = 0.5
 
-                if DEBUG_ANPR:
-                    print(f"  [OCR-TEST] Variant: {variant_name}, PSM: {config[7:13]}, Raw: '{raw_text}', Norm: '{normalized}', Conf: {conf:.2f}")
+                # ── Format-weighted score ────────────────────────────
+                # Indian-format match → 2× bonus; typical 8-10 char length → bonus
+                format_bonus = 2.0 if _indian_re.match(valid_plate) else 1.0
+                # Length bonus: 0 extra at 6 chars, up to +40% at 10+ chars
+                length_bonus = 1.0 + max(0, len(valid_plate) - 6) * 0.05
+                weighted = conf * format_bonus * length_bonus
 
-                if conf > best_conf:
+                psm_str = config.split("--psm")[1].split()[0] if "--psm" in config else "?"
+                if DEBUG_ANPR:
+                    fmt_tag = " [INDIAN]" if format_bonus > 1 else ""
+                    print(f"  [OCR] {variant_name} PSM{psm_str}: '{raw_text.strip()}' "
+                          f"→ '{valid_plate}' conf={conf:.2f} w={weighted:.2f}{fmt_tag}")
+
+                if weighted > best_weighted:
+                    best_weighted = weighted
                     best_conf = conf
                     best_plate = valid_plate
                     best_raw = raw_text
                     best_variant = variant_name
                     if DEBUG_ANPR:
-                        cv2.imwrite(os.path.join(DEBUG_DIR, "latest_processed_plate.jpg"), img)
+                        cv2.imwrite(
+                            os.path.join(DEBUG_DIR, "latest_processed_plate.jpg"), img
+                        )
 
-                if best_conf > 0.85:  # early exit on very high confidence
+                if best_weighted > 1.5:  # early exit: high-conf Indian-format match
                     break
-            if best_conf > 0.85:
+            if best_weighted > 1.5:
                 break
 
         if DEBUG_ANPR:
-            print(f"[OCR] FINAL SELECTED -> Raw: '{best_raw}', Normalized: '{best_plate}', Conf: {best_conf:.2f} (from {best_variant})")
+            print(f"[OCR] FINAL: '{best_raw.strip()}' → '{best_plate}' "
+                  f"conf={best_conf:.2f} weighted={best_weighted:.2f} (from {best_variant})")
             if not best_plate:
-                print("[OCR] OCR failed or returned garbage.")
+                print("[OCR] No valid plate found across all variants.")
 
         return best_plate, best_conf, best_raw
 
@@ -293,11 +355,14 @@ class LicensePlateAnalyzer:
             if DEBUG_ANPR:
                 print(f"[ANPR] Best plate: bbox={px1},{py1},{px2},{py2} conf={plate_confidence:.2f} score={primary['score']:.4f}")
 
-            # Proportional padding: 10% of bbox dimension, min 10px
+            # Proportional padding: 6% of bbox dimension (reduced from 10%)
+            # Rationale: 10% (81px) was too much on a 815px plate — included car body
+            # on both sides which confused OCR. 6% (49px) gives safety margin while
+            # keeping the crop focused on the plate region.
             bw = max(1, px2 - px1)
             bh = max(1, py2 - py1)
-            pad_x = max(10, int(0.10 * bw))
-            pad_y = max(6, int(0.08 * bh))
+            pad_x = max(8, int(0.06 * bw))
+            pad_y = max(5, int(0.06 * bh))
 
             cx1 = max(0, px1 - pad_x)
             cy1 = max(0, py1 - pad_y)
@@ -454,11 +519,12 @@ class LicensePlateAnalyzer:
             if DEBUG_ANPR:
                 print(f"[PRIMARY] bbox=({px1},{py1},{px2},{py2}) conf={plate_confidence:.2f}")
 
-            # Proportional padding: 10% of bbox width / 8% of height, min 15/8 px
+            # Proportional padding: 6% of bbox dimension
+            # (same as analyze() — reduced from 10% to avoid including car body)
             bw = max(1, px2 - px1)
             bh = max(1, py2 - py1)
-            pad_x = max(15, int(0.10 * bw))
-            pad_y = max(8,  int(0.08 * bh))
+            pad_x = max(8, int(0.06 * bw))
+            pad_y = max(5, int(0.06 * bh))
 
             cx1 = max(0, px1 - pad_x)
             cy1 = max(0, py1 - pad_y)
