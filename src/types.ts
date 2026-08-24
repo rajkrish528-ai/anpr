@@ -9,12 +9,17 @@ export interface ParkingResult {
   ocr_success?: boolean;
   plate_number: string;
   yolo_confidence?: number;
+  ocr_confidence?: number;          // returned by /api/anpr/image
+  ocr_engine?: string;              // returned by /api/anpr/image
+  is_valid_indian_format?: boolean; // returned by /api/anpr/image
+  original_crop?: string | null;   // returned by /api/anpr/image
+  preprocessed_crop?: string | null; // returned by /api/anpr/image
   studentName?: string;
   category?: string;
   slot?: string;
   direction?: string;
   source: string;
-  status: "GRANTED" | "ALREADY_PARKED" | "NO_SLOT" | "REJECTED" | "EXITED" | "OCR_FAILED";
+  status: "GRANTED" | "ALREADY_PARKED" | "NO_SLOT" | "REJECTED" | "EXITED" | "OCR_FAILED" | "NO_PLATE" | "UNKNOWN";
   timestamp: string;
   occupied?: number;
   totalSlots?: number;

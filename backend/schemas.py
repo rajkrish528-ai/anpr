@@ -30,16 +30,24 @@ class ManualExit(BaseModel):
 
 class ParkingResult(BaseModel):
     id: int | None = None
-    plate: str
-    studentName: str
-    category: str
-    slot: str
-    direction: str
-    confidence: float
-    source: str
-    status: str = "granted"
+    # Fields from to_web_result() / live websocket events
+    success: bool | None = None
+    plate_detected: bool | None = None
+    ocr_success: bool | None = None
+    plate_number: str | None = None
+    yolo_confidence: float | None = None
+    # Legacy DB fields (kept for backward compat)
+    plate: str | None = None
+    studentName: str | None = None
+    category: str | None = None
+    slot: str | None = None
+    direction: str | None = None
+    source: str | None = None
+    status: str = "GRANTED"
     timestamp: datetime
     processedImage: str | None = None
+    occupied: int | None = None
+    totalSlots: int | None = None
 
 class CameraConfigUpdate(BaseModel):
     device_index: int = Field(ge=0, le=999)

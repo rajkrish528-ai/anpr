@@ -209,6 +209,8 @@ def analyse_image(data_url: str):
     image = cv2.imdecode(np.frombuffer(base64.b64decode(encoded), np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Invalid image frame")
+    # BUG FIX: analysis was never assigned before being accessed
+    analysis = get_analyzer().analyze(image)
     plate_detected = len(analysis["plates"]) > 0
     yolo_confidence = analysis["plates"][0]["confidence"] if plate_detected else 0.0
     plate_number = next((number for number in analysis["numbers"] if number), "")
@@ -346,11 +348,60 @@ ANALYZE_EVERY_N_FRAMES = 5
 
 
 async def configured_camera_stream(websocket: WebSocket, role: str):
-    """Read configured hardware camera frames and emit processed output to its preview."""
+    """Read configured hardware camera frames and emit processed output to its preview.
+
+    Architecture: frame delivery and ANPR inference are decoupled.
+    - Raw/processed frames are streamed continuously at ~10 fps so the video is smooth.
+    - ANPR inference (YOLO+OCR) runs as a background task every Nth frame.
+    - If an inference is already running we skip starting a new one (no pile-up).
+    """
     await websocket.accept()
     capture = None
     current_device_index = None
     frame_counter = 0
+    # Track whether an inference task is in-flight to avoid overlapping calls
+    inference_running = False
+
+    async def run_inference_and_broadcast(frame, src: str):
+        """Fire-and-forget coroutine: runs ANPR and broadcasts; called via create_task."""
+        nonlocal inference_running
+        try:
+            plate_detected, plate_number, yolo_confidence, ocr_success, processed, is_stable = \
+                await asyncio.to_thread(process_camera_frame, frame)
+
+            # Always send the processed (annotated) frame
+            try:
+                await websocket.send_json({
+                    "type": "camera_frame", "source": src, "processedImage": processed,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
+
+            if plate_detected and not ocr_success:
+                now = time.time()
+                if now - recent_reads.get("_OCR_FAILED_", 0) > COOLDOWN_SECONDS:
+                    recent_reads["_OCR_FAILED_"] = now
+                    event = {
+                        "success": False,
+                        "type": "parking_result",
+                        "plate_detected": True,
+                        "ocr_success": False,
+                        "plate_number": "",
+                        "yolo_confidence": yolo_confidence,
+                        "source": src,
+                        "status": "OCR_FAILED",
+                        "processedImage": processed,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                    repository.add_result(event)
+                    await broadcast(event)
+            elif plate_detected and ocr_success and is_stable:
+                await create_result(plate_number, yolo_confidence, src, processed)
+        except Exception as err:
+            print(f"[WARN] Inference task error: {err}")
+        finally:
+            inference_running = False
 
     try:
         while True:
@@ -397,42 +448,22 @@ async def configured_camera_stream(websocket: WebSocket, role: str):
                 consecutive_failures = 0
                 frame_counter += 1
 
-                if frame_counter % ANALYZE_EVERY_N_FRAMES == 0:
-                    plate_detected, plate_number, yolo_confidence, ocr_success, processed, is_stable = await asyncio.to_thread(process_camera_frame, frame)
-                    await websocket.send_json({
-                        "type": "camera_frame", "source": role, "processedImage": processed,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    if plate_detected and not ocr_success:
-                        # OCR Failed warning
-                        now = time.time()
-                        if now - recent_reads.get("_OCR_FAILED_", 0) > COOLDOWN_SECONDS:
-                            recent_reads["_OCR_FAILED_"] = now
-                            event = {
-                                "success": False,
-                                "type": "parking_result",
-                                "plate_detected": True,
-                                "ocr_success": False,
-                                "plate_number": "",
-                                "yolo_confidence": yolo_confidence,
-                                "source": role,
-                                "status": "OCR_FAILED",
-                                "processedImage": processed,
-                                "timestamp": datetime.now(timezone.utc).isoformat()
-                            }
-                            repository.add_result(event)
-                            await broadcast(event)
-                    elif plate_detected and ocr_success and is_stable:
-                        # ONLY allocate parking if the plate read is stable across multiple frames
-                        await create_result(plate_number, yolo_confidence, role, processed)
+                if frame_counter % ANALYZE_EVERY_N_FRAMES == 0 and not inference_running:
+                    # Launch inference as a non-blocking background task
+                    inference_running = True
+                    asyncio.create_task(run_inference_and_broadcast(frame.copy(), role))
                 else:
+                    # Stream raw frame immediately — keeps video smooth
                     raw = await asyncio.to_thread(_encode_frame_as_dataurl, frame)
-                    await websocket.send_json({
-                        "type": "camera_frame", "source": role, "processedImage": raw,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
+                    try:
+                        await websocket.send_json({
+                            "type": "camera_frame", "source": role, "processedImage": raw,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                    except Exception:
+                        break
 
-                await asyncio.sleep(0.10)
+                await asyncio.sleep(0.05)  # ~20 fps cap for smooth video
     except WebSocketDisconnect:
         pass
     except Exception as error:

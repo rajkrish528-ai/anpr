@@ -1,5 +1,9 @@
 """HTTP REST endpoints for admin and result-display clients."""
-from fastapi import APIRouter, HTTPException, Query, status
+import asyncio
+import base64
+import cv2
+import numpy as np
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 from . import vehicle_repository as repository
 from .schemas import (
@@ -220,4 +224,118 @@ def get_pipeline_status():
         "system_cameras": system_cameras,
         "model": "YOLOv8 license-plate + Tesseract OCR",
         "db_connected": True,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# ANPR Image Test endpoint
+# ─────────────────────────────────────────────────────────────
+
+def _run_anpr_on_image(image_bytes: bytes) -> dict:
+    """Synchronous ANPR worker — called via asyncio.to_thread so it
+    never blocks the FastAPI event loop."""
+    from backend.websocket import get_analyzer
+
+    # Decode uploaded bytes → OpenCV image
+    arr = np.frombuffer(image_bytes, np.uint8)
+    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("Could not decode image. Make sure it is a valid JPEG, PNG, or WEBP file.")
+
+    # Run the full pipeline with crop images
+    analysis = get_analyzer().analyze_with_crops(image)
+    return analysis
+
+
+@router.post("/anpr/image")
+async def post_anpr_image(file: UploadFile = File(...)):
+    """Accept an uploaded image, run the full ANPR pipeline, and return
+    detection results including crop images — without writing to the DB
+    or assigning a parking slot (read-only test endpoint).
+    """
+    # ── Validate MIME type ──────────────────────────────────────
+    allowed_types = {"image/jpeg", "image/png", "image/webp", "image/jpg"}
+    content_type = (file.content_type or "").lower()
+    if content_type not in allowed_types:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported file type '{content_type}'. Upload a JPEG, PNG, or WEBP image.",
+        )
+
+    # ── Read file bytes ────────────────────────────────────────
+    try:
+        image_bytes = await file.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {exc}")
+
+    if len(image_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # ── Run ANPR in a thread (non-blocking) ────────────────────
+    try:
+        analysis = await asyncio.to_thread(_run_anpr_on_image, image_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"ANPR processing failed: {exc}")
+
+    plate_number = analysis["best_plate_number"]
+    plate_detected = len(analysis["plates"]) > 0
+    ocr_success = bool(plate_number)
+
+    # ── DB lookup (read-only) ───────────────────────────────────
+    db_status = "UNKNOWN"
+    db_slot = None
+    db_student_name = None
+    db_category = None
+    db_entry_time = None
+
+    if plate_number:
+        normalised = repository.normalise_plate(plate_number)
+        active = repository.get_active_vehicle(normalised)
+        if active:
+            db_status = "ALREADY_PARKED"
+            db_slot = active["slot_id"]
+            db_entry_time = active["entry_time"]
+            person = repository.vehicle_for_plate(normalised)
+            db_student_name = person.get("studentName")
+            db_category = person.get("category")
+        else:
+            person = repository.vehicle_for_plate(normalised)
+            db_student_name = person.get("studentName")
+            db_category = person.get("category")
+            # Check if a slot would be available (informational only)
+            permit_tier = person.get("permit_tier", 5)
+            slot_info = repository.find_available_slot(permit_tier)
+            if slot_info:
+                db_status = "GRANTED"
+                db_slot = slot_info["slot_id"]
+            else:
+                db_status = "NO_SLOT"
+    elif plate_detected:
+        db_status = "OCR_FAILED"
+    else:
+        db_status = "NO_PLATE"
+
+    from datetime import datetime, timezone
+    return {
+        "success": ocr_success,
+        "plate_detected": plate_detected,
+        "ocr_success": ocr_success,
+        "plate_number": plate_number,
+        "yolo_confidence": analysis["best_yolo_confidence"],
+        "ocr_confidence": analysis["best_ocr_confidence"],
+        "ocr_engine": analysis["ocr_engine"],
+        "is_valid_indian_format": analysis["is_valid_indian_format"],
+        "original_crop": analysis["original_crop"],
+        "preprocessed_crop": analysis["preprocessed_crop"],
+        "processedImage": analysis["processedImage"],
+        # DB / parking info (read-only — no slot actually assigned)
+        "status": db_status,
+        "slot": db_slot,
+        "studentName": db_student_name,
+        "category": db_category,
+        "direction": db_entry_time or "",
+        "source": "image_upload",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }

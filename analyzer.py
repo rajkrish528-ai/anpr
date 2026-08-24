@@ -1,6 +1,7 @@
 """
 ANPR Analyzer — YOLO vehicle detection + YOLO plate detection + Tesseract OCR.
 """
+import base64
 import cv2
 import numpy as np
 import re
@@ -317,4 +318,151 @@ class LicensePlateAnalyzer:
             "task": "Object Detection",
             "classes": "vehicle + license_plate",
             "input_size": "640x640",
+        }
+
+    # ──────────────────────────────────────────────────────────
+    # Extended analysis with crop images (for /api/anpr/image)
+    # ──────────────────────────────────────────────────────────
+
+    def analyze_with_crops(self, image):
+        """Run full ANPR pipeline and also return base64-encoded crop images.
+
+        Returns a dict with all analyze() keys plus:
+          - original_crop: data-URL of the raw plate crop (or None)
+          - preprocessed_crop: data-URL of the best preprocessed image fed to OCR (or None)
+          - ocr_confidence: float 0..1 (or 0.0)
+          - ocr_engine: str
+          - is_valid_indian_format: bool
+        """
+        if image is None:
+            raise ValueError("Image cannot be None.")
+
+        output_image = image.copy()
+        h, w = image.shape[:2]
+
+        if DEBUG_ANPR:
+            print("\n" + "="*50)
+            print(f"[ANPR] analyze_with_crops — frame ({w}x{h})")
+
+        # ── 1. Detect vehicles ──────────────────────────────────
+        vehicle_results = self.vehicle_model(image, conf=0.25, verbose=False)
+        vehicles = []
+        for result in vehicle_results:
+            if result.boxes is None:
+                continue
+            for box, conf, cls in zip(result.boxes.xyxy, result.boxes.conf, result.boxes.cls):
+                cls_int = int(cls)
+                if cls_int not in self.vehicle_classes:
+                    continue
+                vx1, vy1, vx2, vy2 = map(int, box)
+                cv2.rectangle(output_image, (vx1, vy1), (vx2, vy2), (255, 0, 0), 2)
+                cv2.putText(
+                    output_image,
+                    f"{self.vehicle_classes[cls_int]} {float(conf):.2f}",
+                    (vx1, vy1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (255, 0, 0), 2,
+                )
+                vehicles.append({
+                    "vehicle_type": self.vehicle_classes[cls_int],
+                    "vehicle_confidence": round(float(conf), 3),
+                })
+
+        # ── 2. Detect plates ────────────────────────────────────
+        plates = []
+        numbers = []
+        best_plate_number = ""
+        best_yolo_confidence = 0.0
+        best_ocr_confidence = 0.0
+        original_crop_b64 = None
+        preprocessed_crop_b64 = None
+
+        plate_results = self.plate_model(image, conf=self.confidence, verbose=False)
+        for plate_result in plate_results:
+            if plate_result.boxes is None:
+                continue
+            for box, conf in zip(plate_result.boxes.xyxy, plate_result.boxes.conf):
+                px1, py1, px2, py2 = map(int, box)
+                plate_confidence = float(conf)
+
+                if plate_confidence > best_yolo_confidence:
+                    best_yolo_confidence = plate_confidence
+
+                padding = 10
+                cx1 = max(0, px1 - padding)
+                cy1 = max(0, py1 - padding)
+                cx2 = min(w, px2 + padding)
+                cy2 = min(h, py2 + padding)
+
+                plate_crop = image[cy1:cy2, cx1:cx2]
+                crop_h, crop_w = plate_crop.shape[:2]
+
+                if DEBUG_ANPR:
+                    print(f"[CROP] {crop_w}x{crop_h}, YOLO conf={plate_confidence:.2f}")
+
+                # Encode raw crop as base64 (always, even if too small for OCR)
+                ok_raw, raw_enc = cv2.imencode(".jpg", plate_crop)
+                if ok_raw:
+                    original_crop_b64 = f"data:image/jpeg;base64,{base64.b64encode(raw_enc).decode()}"
+
+                if crop_w < 40 or crop_h < 15:
+                    cv2.rectangle(output_image, (px1, py1), (px2, py2), (0, 165, 255), 2)
+                    cv2.putText(output_image, "TOO SMALL", (px1, py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    plates.append({"confidence": plate_confidence})
+                    continue
+
+                # Run multi-variant OCR and capture the best preprocessed image
+                plate_number, ocr_conf, _ = self.read_plate(plate_crop)
+
+                # Capture the best preprocessed variant as base64
+                preprocessed_path = os.path.join(DEBUG_DIR, "latest_processed_plate.jpg")
+                if os.path.exists(preprocessed_path):
+                    prep_img = cv2.imread(preprocessed_path)
+                    if prep_img is not None:
+                        ok_prep, prep_enc = cv2.imencode(".jpg", prep_img)
+                        if ok_prep:
+                            preprocessed_crop_b64 = f"data:image/jpeg;base64,{base64.b64encode(prep_enc).decode()}"
+
+                color = (0, 255, 0) if plate_number else (0, 165, 255)
+                cv2.rectangle(output_image, (px1, py1), (px2, py2), color, 2)
+                label = f"{plate_number} {ocr_conf:.0%}" if plate_number else f"plate {plate_confidence:.2f}"
+                cv2.putText(output_image, label, (px1, py1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+                if plate_number:
+                    numbers.append(plate_number)
+                    if ocr_conf > best_ocr_confidence:
+                        best_ocr_confidence = ocr_conf
+                        best_plate_number = plate_number
+
+                plates.append({"confidence": plate_confidence})
+
+        # ── 3. Encode processed image ───────────────────────────
+        ok_out, out_enc = cv2.imencode(".jpg", output_image)
+        processed_b64 = (
+            f"data:image/jpeg;base64,{base64.b64encode(out_enc).decode()}"
+            if ok_out else None
+        )
+
+        # ── 4. Indian plate format validation ──────────────────
+        # Pattern: 2 letters + 2 digits + optional 1-2 letters + 4 digits  (e.g. MH12AB1234)
+        indian_pattern = re.compile(
+            r"^[A-Z]{2}[0-9]{2}[A-Z]{0,3}[0-9]{4}$"
+        )
+        is_valid_indian = bool(best_plate_number and indian_pattern.match(best_plate_number))
+
+        return {
+            "image": output_image,
+            "plates": plates,
+            "numbers": numbers,
+            "vehicles": vehicles,
+            "best_plate_number": best_plate_number,
+            "best_yolo_confidence": best_yolo_confidence,
+            "best_ocr_confidence": best_ocr_confidence,
+            "original_crop": original_crop_b64,
+            "preprocessed_crop": preprocessed_crop_b64,
+            "processedImage": processed_b64,
+            "ocr_engine": "Tesseract OCR",
+            "is_valid_indian_format": is_valid_indian,
         }
