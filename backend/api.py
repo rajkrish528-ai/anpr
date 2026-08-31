@@ -9,10 +9,12 @@ from . import vehicle_repository as repository
 from .schemas import (
     ManualCheck, ManualExit, ParkingResult, VehicleCreate, VehicleRecord, VehicleUpdate,
     LoginRequest, AuthResponse, AppSettings, CameraConfig, CameraConfigUpdate,
+    SlotInfoUpdate, ParkingVerify,
 )
 from . import cameras_input
 from .auth import get_current_admin, verify_password, create_session_token, oauth2_scheme
 from .database import get_connection
+from .logger import log, LogLevel, EventType
 from typing import Annotated, Any
 from fastapi import Depends
 
@@ -32,6 +34,8 @@ def login(payload: LoginRequest):
         ).fetchone()
 
         if not admin or not verify_password(payload.password, admin["password_hash"]):
+            log(LogLevel.WARN, EventType.ADMIN_ACTION,
+                f"Failed login attempt for {payload.email}", source="api")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password",
@@ -39,6 +43,8 @@ def login(payload: LoginRequest):
             )
 
         token = create_session_token(admin["id"])
+        log(LogLevel.INFO, EventType.ADMIN_ACTION,
+            f"Admin login: {payload.email}", source="api")
         return {"token": token, "admin_id": admin["id"]}
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -65,19 +71,27 @@ def get_vehicle(plate: str):
 def post_vehicle(payload: VehicleCreate, admin: Annotated[dict, Depends(get_current_admin)]):
     if repository.get_vehicle(payload.plate):
         raise HTTPException(status_code=409, detail="A vehicle with this plate already exists")
-    return repository.create_vehicle(payload.plate, payload.owner_name, payload.category, payload.permit_tier)
+    result = repository.create_vehicle(payload.plate, payload.owner_name, payload.category, payload.permit_tier)
+    log(LogLevel.INFO, EventType.ADMIN_ACTION,
+        f"Vehicle added: {payload.plate} ({payload.owner_name}, {payload.category})",
+        plate=payload.plate, category=payload.category, source="admin_api")
+    return result
 
 @router.patch("/vehicles/{plate}", response_model=VehicleRecord)
 def patch_vehicle(plate: str, payload: VehicleUpdate, admin: Annotated[dict, Depends(get_current_admin)]):
     vehicle = repository.update_vehicle(plate, payload.owner_name, payload.category, payload.permit_tier)
     if not vehicle:
         raise HTTPException(status_code=404, detail="Vehicle record not found")
+    log(LogLevel.INFO, EventType.ADMIN_ACTION,
+        f"Vehicle updated: {plate}", plate=plate, source="admin_api")
     return vehicle
 
 @router.delete("/vehicles/{plate}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_vehicle(plate: str, admin: Annotated[dict, Depends(get_current_admin)]):
     if not repository.delete_vehicle(plate):
         raise HTTPException(status_code=404, detail="Vehicle record not found")
+    log(LogLevel.INFO, EventType.ADMIN_ACTION,
+        f"Vehicle deleted: {plate}", plate=plate, source="admin_api")
 
 # ─────────────────────────────────────────────────────────────
 # Results (live activity log)
@@ -139,8 +153,75 @@ async def post_vehicle_exit(payload: ManualExit):
 
 @router.get("/slots")
 def get_slots():
-    """Return all parking slots with their current status."""
+    """Return all parking slots with their current status and navigation info."""
     return repository.list_slots()
+
+@router.get("/slots/{slot_id}")
+def get_slot(slot_id: str):
+    """Return a single slot with full navigation info."""
+    slot = repository.get_slot(slot_id)
+    if not slot:
+        raise HTTPException(status_code=404, detail="Slot not found")
+    return slot
+
+@router.put("/slots/{slot_id}/info")
+def put_slot_info(
+    slot_id: str,
+    payload: SlotInfoUpdate,
+    admin: Annotated[dict, Depends(get_current_admin)],
+):
+    """Admin: set navigation details for a specific parking slot."""
+    slot = repository.get_slot(slot_id)
+    if not slot:
+        raise HTTPException(status_code=404, detail="Slot not found")
+
+    directions_list = [step.model_dump() for step in payload.directions]
+    updated = repository.update_slot_info(
+        slot_id=slot_id,
+        path_description=payload.path_description,
+        directions=directions_list,
+        floor=payload.floor,
+        section=payload.section,
+    )
+    log(LogLevel.INFO, EventType.SLOT_INFO_UPDATED,
+        f"Slot {slot_id} nav info updated by admin",
+        slot_id=slot_id, source="admin_api")
+    return updated
+
+# ─────────────────────────────────────────────────────────────
+# Parking Verification (parking camera confirms vehicle parked)
+# ─────────────────────────────────────────────────────────────
+
+@router.post("/parking/verify")
+async def post_parking_verify(payload: ParkingVerify):
+    """Manually or camera-triggered: confirm vehicle has physically parked."""
+    from .websocket import verify_parking
+    result = await verify_parking(
+        repository.normalise_plate(payload.plate),
+        source=payload.source,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Vehicle not found in active parking.")
+    return result
+
+# ─────────────────────────────────────────────────────────────
+# Parking Queue
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/queue")
+def get_queue():
+    """Return the current waiting queue."""
+    return repository.queue_get_waiting()
+
+@router.delete("/queue/{plate}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_from_queue(plate: str, admin: Annotated[dict, Depends(get_current_admin)]):
+    """Admin: remove a vehicle from the waiting queue."""
+    removed = repository.queue_remove(repository.normalise_plate(plate), status="abandoned")
+    if not removed:
+        raise HTTPException(status_code=404, detail="Vehicle not found in queue")
+    log(LogLevel.INFO, EventType.QUEUE_ABANDONED,
+        f"Vehicle {plate} removed from queue by admin",
+        plate=plate, source="admin_api")
 
 # ─────────────────────────────────────────────────────────────
 # Parking History
@@ -150,6 +231,24 @@ def get_slots():
 def get_history(limit: int = Query(default=50, ge=1, le=500)):
     """Return completed parking sessions."""
     return repository.list_history(limit)
+
+# ─────────────────────────────────────────────────────────────
+# System Logs
+# ─────────────────────────────────────────────────────────────
+
+@router.get("/logs")
+def get_logs(
+    limit: int = Query(default=100, ge=1, le=500),
+    level: str | None = Query(default=None),
+    plate: str | None = Query(default=None),
+):
+    """Return system event logs with optional filters."""
+    return repository.list_logs(limit=limit, level_filter=level, plate_filter=plate)
+
+@router.get("/logs/stats")
+def get_log_stats():
+    """Return log counts per severity level for today."""
+    return repository.get_log_stats()
 
 # ─────────────────────────────────────────────────────────────
 # Camera system
@@ -190,7 +289,11 @@ def get_settings():
 
 @router.put("/settings", response_model=AppSettings)
 def put_settings(payload: AppSettings, admin: Annotated[dict, Depends(get_current_admin)]):
-    return repository.save_settings(payload.campus_name, payload.total_slots)
+    result = repository.save_settings(payload.campus_name, payload.total_slots)
+    log(LogLevel.INFO, EventType.ADMIN_ACTION,
+        f"Settings updated: campus={payload.campus_name}, slots={payload.total_slots}",
+        source="admin_api")
+    return result
 
 # ─────────────────────────────────────────────────────────────
 # Pipeline status
@@ -236,13 +339,11 @@ def _run_anpr_on_image(image_bytes: bytes) -> dict:
     never blocks the FastAPI event loop."""
     from backend.websocket import get_analyzer
 
-    # Decode uploaded bytes → OpenCV image
     arr = np.frombuffer(image_bytes, np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Could not decode image. Make sure it is a valid JPEG, PNG, or WEBP file.")
 
-    # Run the full pipeline with crop images
     analysis = get_analyzer().analyze_with_crops(image)
     return analysis
 
@@ -253,7 +354,6 @@ async def post_anpr_image(file: UploadFile = File(...)):
     detection results including crop images — without writing to the DB
     or assigning a parking slot (read-only test endpoint).
     """
-    # ── Validate MIME type ──────────────────────────────────────
     allowed_types = {"image/jpeg", "image/png", "image/webp", "image/jpg"}
     content_type = (file.content_type or "").lower()
     if content_type not in allowed_types:
@@ -262,7 +362,6 @@ async def post_anpr_image(file: UploadFile = File(...)):
             detail=f"Unsupported file type '{content_type}'. Upload a JPEG, PNG, or WEBP image.",
         )
 
-    # ── Read file bytes ────────────────────────────────────────
     try:
         image_bytes = await file.read()
     except Exception as exc:
@@ -271,7 +370,6 @@ async def post_anpr_image(file: UploadFile = File(...)):
     if len(image_bytes) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    # ── Run ANPR in a thread (non-blocking) ────────────────────
     try:
         analysis = await asyncio.to_thread(_run_anpr_on_image, image_bytes)
     except ValueError as exc:
@@ -283,12 +381,15 @@ async def post_anpr_image(file: UploadFile = File(...)):
     plate_detected = len(analysis["plates"]) > 0
     ocr_success = bool(plate_number)
 
-    # ── DB lookup (read-only) ───────────────────────────────────
     db_status = "UNKNOWN"
     db_slot = None
     db_student_name = None
     db_category = None
     db_entry_time = None
+    db_path_description = None
+    db_directions = []
+    db_floor = None
+    db_section = None
 
     if plate_number:
         normalised = repository.normalise_plate(plate_number)
@@ -304,12 +405,15 @@ async def post_anpr_image(file: UploadFile = File(...)):
             person = repository.vehicle_for_plate(normalised)
             db_student_name = person.get("studentName")
             db_category = person.get("category")
-            # Check if a slot would be available (informational only)
             permit_tier = person.get("permit_tier", 5)
             slot_info = repository.find_available_slot(permit_tier)
             if slot_info:
                 db_status = "GRANTED"
                 db_slot = slot_info["slot_id"]
+                db_path_description = slot_info.get("path_description", "")
+                db_directions = slot_info.get("directions_parsed", [])
+                db_floor = slot_info.get("floor", "")
+                db_section = slot_info.get("section", "")
             else:
                 db_status = "NO_SLOT"
     elif plate_detected:
@@ -330,12 +434,15 @@ async def post_anpr_image(file: UploadFile = File(...)):
         "original_crop": analysis["original_crop"],
         "preprocessed_crop": analysis["preprocessed_crop"],
         "processedImage": analysis["processedImage"],
-        # DB / parking info (read-only — no slot actually assigned)
         "status": db_status,
         "slot": db_slot,
         "studentName": db_student_name,
         "category": db_category,
         "direction": db_entry_time or "",
+        "path_description": db_path_description,
+        "directions": db_directions,
+        "floor": db_floor,
+        "section": db_section,
         "source": "image_upload",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

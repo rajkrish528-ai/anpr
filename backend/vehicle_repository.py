@@ -1,4 +1,5 @@
 """Parameterized SQLite commands for vehicles, parking slots, active parking, and results."""
+import json
 import re
 from datetime import datetime, timezone
 from .database import get_connection
@@ -72,27 +73,56 @@ def vehicle_for_plate(plate: str):
 def list_slots():
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM parking_slots ORDER BY slot_id").fetchall()
-    return [dict(row) for row in rows]
+    return [_enrich_slot(dict(row)) for row in rows]
+
+def get_slot(slot_id: str):
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM parking_slots WHERE slot_id = ?", (slot_id,)).fetchone()
+    return _enrich_slot(dict(row)) if row else None
+
+def _enrich_slot(row: dict) -> dict:
+    """Parse directions JSON for API consumers."""
+    try:
+        row["directions_parsed"] = json.loads(row.get("directions") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        row["directions_parsed"] = []
+    return row
+
+def update_slot_info(slot_id: str, path_description: str, directions: list, floor: str, section: str) -> dict | None:
+    """Admin: update per-slot navigation details."""
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE parking_slots
+               SET path_description = ?, directions = ?, floor = ?, section = ?
+               WHERE slot_id = ?""",
+            (path_description, json.dumps(directions), floor, section, slot_id),
+        )
+    return get_slot(slot_id)
 
 def find_available_slot(permit_tier: int):
     """Find the first available slot that the permit tier can access.
-    
-    Tier 1 can park anywhere. Tier 4 can only park in tier-4+ zones.
-    Visitor (tier 5) can only park in visitor slots.
+
+    Tier 1 (VIP) can park anywhere; lower tier # = higher privilege.
+    Tier 5 (Visitor) can only park in visitor slots.
+    Returns full slot info including navigation details.
     """
     with get_connection() as conn:
-        # Find a slot where:
-        # - status is 'available'
-        # - the slot's min_permit_tier >= the vehicle's tier 
-        #   (lower tier number = higher priority, can access more zones)
         row = conn.execute(
-            """SELECT slot_id, zone FROM parking_slots 
+            """SELECT slot_id, zone, path_description, directions, floor, section
+               FROM parking_slots
                WHERE status = 'available' AND min_permit_tier >= ?
                ORDER BY min_permit_tier DESC, slot_id ASC
                LIMIT 1""",
             (permit_tier,),
         ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    result = dict(row)
+    try:
+        result["directions_parsed"] = json.loads(result.get("directions") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        result["directions_parsed"] = []
+    return result
 
 def occupy_slot(slot_id: str, plate: str):
     with get_connection() as conn:
@@ -134,6 +164,16 @@ def park_vehicle(plate: str, slot_id: str, owner_name: str, category: str, permi
             (plate, slot_id, owner_name, category, permit_tier),
         )
 
+def verify_vehicle_parked(plate: str) -> bool:
+    """Mark a vehicle's parking as verified by the parking camera."""
+    plate = normalise_plate(plate)
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE active_parking SET verified = 1 WHERE plate = ?",
+            (plate,),
+        )
+    return cursor.rowcount > 0
+
 def exit_vehicle(plate: str):
     """Remove vehicle from active parking, release its slot, and save to history.
     Returns the history record or None if vehicle wasn't parked."""
@@ -145,12 +185,10 @@ def exit_vehicle(plate: str):
     # Calculate duration
     entry = datetime.fromisoformat(active["entry_time"].replace(" ", "T"))
     now = datetime.now(timezone.utc)
-    # entry_time from SQLite is in UTC (CURRENT_TIMESTAMP)
     entry_utc = entry.replace(tzinfo=timezone.utc) if entry.tzinfo is None else entry
     duration = max(0, int((now - entry_utc).total_seconds() / 60))
 
     with get_connection() as conn:
-        # Save to history
         conn.execute(
             """INSERT INTO parking_history (plate, slot_id, owner_name, category, permit_tier, entry_time, exit_time, duration_minutes, source)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -158,10 +196,8 @@ def exit_vehicle(plate: str):
              active["permit_tier"], active["entry_time"],
              now.isoformat(), duration, "system"),
         )
-        # Remove from active
         conn.execute("DELETE FROM active_parking WHERE plate = ?", (plate,))
 
-    # Release slot
     release_slot(active["slot_id"])
 
     return {
@@ -177,6 +213,99 @@ def count_occupied():
     with get_connection() as conn:
         row = conn.execute("SELECT COUNT(*) FROM active_parking").fetchone()
     return row[0] if row else 0
+
+# ─────────────────────────────────────────────────────────────
+# Parking Queue
+# ─────────────────────────────────────────────────────────────
+
+def queue_add(plate: str, owner_name: str, category: str, permit_tier: int) -> dict | None:
+    """Add a vehicle to the waiting queue. Returns queue entry or None if already queued."""
+    plate = normalise_plate(plate)
+    try:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """INSERT INTO parking_queue (plate, owner_name, category, permit_tier)
+                   VALUES (?, ?, ?, ?)""",
+                (plate, owner_name, category, permit_tier),
+            )
+            row = conn.execute("SELECT * FROM parking_queue WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return dict(row)
+    except Exception:
+        return None  # already in queue (UNIQUE constraint)
+
+def queue_get_waiting() -> list[dict]:
+    """Return all vehicles currently waiting in queue, ordered by join time."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM parking_queue WHERE status = 'waiting' ORDER BY joined_at ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+def queue_get_position(plate: str) -> int:
+    """Return 1-based queue position for a plate, or 0 if not in queue."""
+    plate = normalise_plate(plate)
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT plate FROM parking_queue WHERE status = 'waiting' ORDER BY joined_at ASC"
+        ).fetchall()
+    plates = [r["plate"] for r in rows]
+    try:
+        return plates.index(plate) + 1
+    except ValueError:
+        return 0
+
+def queue_remove(plate: str, status: str = "abandoned") -> bool:
+    """Remove (or mark as assigned/abandoned) a vehicle from the queue."""
+    plate = normalise_plate(plate)
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE parking_queue SET status = ? WHERE plate = ? AND status = 'waiting'",
+            (status, plate),
+        )
+    return cursor.rowcount > 0
+
+def queue_assign_next(freed_slot_id: str) -> dict | None:
+    """When a slot is freed, find the next eligible queued vehicle and assign it.
+
+    Returns dict with {plate, owner_name, category, permit_tier, slot_info} or None.
+    """
+    with get_connection() as conn:
+        # Get slot details to know its min_permit_tier
+        slot_row = conn.execute(
+            "SELECT min_permit_tier FROM parking_slots WHERE slot_id = ? AND status = 'available'",
+            (freed_slot_id,),
+        ).fetchone()
+        if not slot_row:
+            return None
+        slot_min_tier = slot_row["min_permit_tier"]
+
+        # Find the first queued vehicle whose permit_tier is <= slot_min_tier (eligible)
+        next_vehicle = conn.execute(
+            """SELECT * FROM parking_queue
+               WHERE status = 'waiting' AND permit_tier <= ?
+               ORDER BY joined_at ASC LIMIT 1""",
+            (slot_min_tier,),
+        ).fetchone()
+
+    if not next_vehicle:
+        return None
+
+    v = dict(next_vehicle)
+    slot_info = find_available_slot(v["permit_tier"])
+    if not slot_info:
+        return None
+
+    # Park the vehicle
+    park_vehicle(v["plate"], slot_info["slot_id"], v["owner_name"], v["category"], v["permit_tier"])
+    queue_remove(v["plate"], status="assigned")
+
+    return {
+        "plate": v["plate"],
+        "owner_name": v["owner_name"],
+        "category": v["category"],
+        "permit_tier": v["permit_tier"],
+        "slot_info": slot_info,
+    }
 
 # ─────────────────────────────────────────────────────────────
 # Parking History
@@ -196,9 +325,9 @@ def add_result(result: dict):
         cursor = conn.execute(
             """INSERT INTO parking_results (plate, owner_name, category, slot, direction, confidence, source, status)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (result.get("plate_number", ""), result.get("studentName", "Visitor"), result.get("category", "Guest"), result.get("slot", ""),
-             result.get("direction", ""), result.get("yolo_confidence", 0.0), result.get("source", "gate"),
-             result.get("status", "GRANTED")),
+            (result.get("plate_number", ""), result.get("studentName", "Visitor"), result.get("category", "Guest"),
+             result.get("slot", ""), result.get("direction", ""), result.get("yolo_confidence", 0.0),
+             result.get("source", "gate"), result.get("status", "GRANTED")),
         )
     result["id"] = cursor.lastrowid
     return result
@@ -234,6 +363,44 @@ def to_web_result(row: dict):
     }
 
 # ─────────────────────────────────────────────────────────────
+# System Logs
+# ─────────────────────────────────────────────────────────────
+
+def list_logs(limit: int = 100, level_filter: str | None = None, plate_filter: str | None = None) -> list[dict]:
+    """Return system logs, most recent first."""
+    query = "SELECT * FROM system_logs WHERE 1=1"
+    params: list = []
+    if level_filter:
+        query += " AND level = ?"
+        params.append(level_filter.upper())
+    if plate_filter:
+        query += " AND plate LIKE ?"
+        params.append(f"%{normalise_plate(plate_filter)}%")
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with get_connection() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+def get_log_stats() -> dict:
+    """Return count of logs per level for the current day."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT level, COUNT(*) as count FROM system_logs WHERE DATE(created_at) = DATE('now') GROUP BY level"
+        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM system_logs").fetchone()[0]
+    counts = {row["level"]: row["count"] for row in rows}
+    return {
+        "total": total,
+        "today_debug":    counts.get("DEBUG", 0),
+        "today_info":     counts.get("INFO", 0),
+        "today_warn":     counts.get("WARN", 0),
+        "today_error":    counts.get("ERROR", 0),
+        "today_critical": counts.get("CRITICAL", 0),
+    }
+
+# ─────────────────────────────────────────────────────────────
 # Dashboard Statistics
 # ─────────────────────────────────────────────────────────────
 
@@ -252,6 +419,9 @@ def get_dashboard_stats():
         rejected = conn.execute(
             "SELECT COUNT(*) FROM parking_results WHERE DATE(created_at) = DATE('now') AND status IN ('already_parked', 'no_slot', 'rejected')"
         ).fetchone()[0]
+        queue_count = conn.execute(
+            "SELECT COUNT(*) FROM parking_queue WHERE status = 'waiting'"
+        ).fetchone()[0]
     return {
         "total_slots": total,
         "occupied": occupied,
@@ -260,6 +430,7 @@ def get_dashboard_stats():
         "today_entries": today_entries,
         "today_exits": today_exits,
         "today_rejected": rejected,
+        "queue_waiting": queue_count,
     }
 
 # ─────────────────────────────────────────────────────────────

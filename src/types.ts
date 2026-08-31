@@ -2,6 +2,63 @@
 // Shared domain types for the Smart Parking frontend
 // ─────────────────────────────────────────────────────────────
 
+// ── Navigation direction step ─────────────────────────────────────────────────
+export interface DirectionStep {
+  action: "straight" | "left" | "right" | "arrive";
+  landmark: string;
+}
+
+// ── Slot navigation info ──────────────────────────────────────────────────────
+export interface SlotInfo {
+  slot_id: string;
+  zone: string;
+  min_permit_tier: number;
+  status: "available" | "occupied";
+  occupied_by?: string | null;
+  path_description: string;
+  directions: string;          // raw JSON string from DB
+  directions_parsed?: DirectionStep[];
+  floor: string;
+  section: string;
+}
+
+// ── System log entry ──────────────────────────────────────────────────────────
+export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR" | "CRITICAL";
+
+export interface SystemLog {
+  id: number;
+  level: LogLevel;
+  event_type: string;
+  message: string;
+  plate?: string | null;
+  slot_id?: string | null;
+  category?: string | null;
+  source?: string | null;
+  extra?: string | null;
+  created_at: string;
+}
+
+export interface LogStats {
+  total: number;
+  today_debug: number;
+  today_info: number;
+  today_warn: number;
+  today_error: number;
+  today_critical: number;
+}
+
+// ── Queue entry ───────────────────────────────────────────────────────────────
+export interface QueueEntry {
+  id: number;
+  plate: string;
+  owner_name: string;
+  category: string;
+  permit_tier: number;
+  joined_at: string;
+  status: "waiting" | "assigned" | "abandoned";
+}
+
+// ── Main parking result ───────────────────────────────────────────────────────
 export interface ParkingResult {
   id?: number;
   success?: boolean;
@@ -9,20 +66,37 @@ export interface ParkingResult {
   ocr_success?: boolean;
   plate_number: string;
   yolo_confidence?: number;
-  ocr_confidence?: number;          // returned by /api/anpr/image
-  ocr_engine?: string;              // returned by /api/anpr/image
-  is_valid_indian_format?: boolean; // returned by /api/anpr/image
-  original_crop?: string | null;   // returned by /api/anpr/image
+  ocr_confidence?: number;           // returned by /api/anpr/image
+  ocr_engine?: string;               // returned by /api/anpr/image
+  is_valid_indian_format?: boolean;  // returned by /api/anpr/image
+  original_crop?: string | null;     // returned by /api/anpr/image
   preprocessed_crop?: string | null; // returned by /api/anpr/image
   studentName?: string;
   category?: string;
   slot?: string;
   direction?: string;
+  path_description?: string;
+  directions?: DirectionStep[];
+  floor?: string;
+  section?: string;
   source: string;
-  status: "GRANTED" | "ALREADY_PARKED" | "NO_SLOT" | "REJECTED" | "EXITED" | "OCR_FAILED" | "NO_PLATE" | "UNKNOWN";
+  status:
+    | "GRANTED"
+    | "ALREADY_PARKED"
+    | "NO_SLOT"
+    | "QUEUED"
+    | "QUEUE_ASSIGNED"
+    | "VERIFIED"
+    | "REJECTED"
+    | "EXITED"
+    | "OCR_FAILED"
+    | "NO_PLATE"
+    | "UNKNOWN";
+  queue_position?: number;
   timestamp: string;
   occupied?: number;
   totalSlots?: number;
+  queue_waiting?: number;
   processedImage?: string | null;
   permit_tier?: number;
 }
@@ -45,6 +119,7 @@ export interface ActiveVehicle {
   category: string;
   permit_tier: number;
   entry_time: string;
+  verified: number;
 }
 
 export interface DashboardStats {
@@ -55,6 +130,7 @@ export interface DashboardStats {
   today_entries: number;
   today_exits: number;
   today_rejected: number;
+  queue_waiting: number;
 }
 
 export interface SystemCamera {

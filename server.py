@@ -57,6 +57,10 @@ def _reconcile_camera_configs() -> None:
 async def on_startup():
     initialise_database()
     _reconcile_camera_configs()
+    # Log system start
+    from backend.logger import log as syslog, LogLevel, EventType
+    syslog(LogLevel.INFO, EventType.SYSTEM_START,
+           "Smart Parking System started", source="server")
     # Pre-load YOLO + Tesseract in background so camera views open instantly
     from backend.websocket import preload_analyzer
     await preload_analyzer()
